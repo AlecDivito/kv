@@ -1,4 +1,5 @@
-use std::process::exit;
+use kvs::{KvError, KvStore, Result};
+use std::env;
 use structopt::StructOpt;
 
 #[derive(StructOpt)]
@@ -34,20 +35,28 @@ struct Opt {
     value: Option<String>,
 }
 
-fn main() {
+fn main() -> Result<()> {
     let opt = Kvs::from_args();
+    let mut kvs = KvStore::open(env::current_dir().unwrap())?;
     match opt {
-        Kvs::Set { key, value } => {
-            eprintln!("unimplemented");
-            exit(1);
-        }
+        Kvs::Set { key, value } => kvs.set(key, value),
+        Kvs::Rm { key } => match kvs.remove(key) {
+            Ok(_) => Ok(()),
+            Err(e) => match e {
+                KvError::KeyNotFound(_) => {
+                    println!("Key not found");
+                    std::process::exit(1);
+                }
+                _ => Err(e),
+            },
+        },
         Kvs::Get { key } => {
-            eprintln!("unimplemented");
-            exit(1);
-        }
-        Kvs::Rm { key } => {
-            eprintln!("unimplemented");
-            exit(1);
+            let value = kvs.get(key)?;
+            match value {
+                Some(v) => println!("{}", v),
+                None => println!("Key not found"),
+            };
+            Ok(())
         }
         _ => unreachable!(),
     }
