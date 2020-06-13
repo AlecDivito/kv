@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error;
-use std::fmt;
+use std::fmt::{self};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -46,6 +46,8 @@ pub enum KvError {
     Parse(CustomError),
     /// The `Decrypt` error is used to throw an error when trying to get a value from our log file
     Decrypt(FromUtf8Error),
+    /// The `Compact` error is used when we fail to compact the active log
+    Compact(CustomError),
 }
 
 /// `Result` is a error helper for `KvError`
@@ -59,21 +61,12 @@ impl fmt::Display for KvError {
             KvError::KeyNotFound(ref err) => write!(f, "KeyNotFound Err: {}", err),
             KvError::Parse(ref err) => write!(f, "Prase Err: {}", err),
             KvError::Decrypt(ref err) => write!(f, "Decrypt Err: {}", err),
+            KvError::Compact(ref err) => write!(f, "Compact Err: {}", err),
         }
     }
 }
 
 impl error::Error for KvError {
-    fn description(&self) -> &str {
-        match *self {
-            KvError::Io(ref err) => err.description(),
-            KvError::Serialize(ref err) => err.description(),
-            KvError::KeyNotFound(ref err) => err.description(),
-            KvError::Parse(ref err) => err.description(),
-            KvError::Decrypt(ref err) => err.description(),
-        }
-    }
-
     fn cause(&self) -> Option<&dyn error::Error> {
         match *self {
             KvError::Io(ref err) => Some(err),
@@ -81,6 +74,7 @@ impl error::Error for KvError {
             KvError::KeyNotFound(ref err) => Some(err),
             KvError::Parse(ref err) => Some(err),
             KvError::Decrypt(ref err) => Some(err),
+            KvError::Compact(ref err) => Some(err),
         }
     }
 }
@@ -138,6 +132,7 @@ impl<'a> Command<'a> {
 
 #[derive(Debug)]
 struct LogPointer {
+    file_path: PathBuf,
     value_length: u64,
     value_position: u64,
 }
@@ -147,10 +142,11 @@ const BINCODE_STRING_OPTION_OFFSET: u64 = 1;
 const BINCODE_STRING_OFFSET: u64 = BINCODE_STRING_LENGTH_OFFSET + BINCODE_STRING_OPTION_OFFSET;
 
 impl LogPointer {
-    pub fn write(offset: u64, command: &Command) -> LogPointer {
+    pub fn write(file_path: PathBuf, offset: u64, command: &Command) -> LogPointer {
         let value_length = command.get_value_length();
         let value_position = offset + BINCODE_STRING_OFFSET;
         LogPointer {
+            file_path,
             value_length,
             value_position,
         }
@@ -166,7 +162,7 @@ impl LogPointer {
 /// ```rust
 /// # use kvs::{KvStore, KvError, Result};
 /// # fn main() -> Result<()> {
-/// let mut store = KvStore::open("")?;
+/// let mut store = KvStore::open("./")?;
 /// store.set("key".to_owned(), "value".to_owned())?;
 /// let val = store.get("key".to_owned())?;
 /// assert_eq!(val, Some("value".to_owned()));
@@ -177,9 +173,13 @@ impl LogPointer {
 pub struct KvStore {
     directory: PathBuf,
     map: HashMap<String, LogPointer>,
+    logs: HashSet<PathBuf>,
 }
 
+const FILE_SUFFIX: &'static str = ".database";
 const ACTIVE_FILE: &'static str = "index.database";
+const COMPACT_FILE: &'static str = "compact.database";
+const MAX_LOG_FILE_SIZE: u64 = 64 * 1024;
 
 impl KvStore {
     /// Create a `kvStore`
@@ -187,47 +187,52 @@ impl KvStore {
         KvStore {
             map: HashMap::new(),
             directory: PathBuf::new().join(".database"),
+            logs: HashSet::new(),
         }
     }
 
     /// Build a `kvStore` from a database folder
     pub fn open(folder: impl Into<PathBuf>) -> Result<KvStore> {
-        let path = folder.into();
-        let index_path = Path::new(&path).join(ACTIVE_FILE);
-        let index_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(index_path)?;
+        let database_path = folder.into();
 
-        // https://doc.rust-lang.org/beta/std/io/trait.Read.html#method.chain
-        let index_file_length = index_file.metadata().unwrap().len();
-        let mut reader = BufReader::new(index_file);
+        let mut logs = HashSet::new();
         let mut map = HashMap::new();
-        let mut length_buffer = [0; 8];
-        while reader.seek(SeekFrom::Current(0)).unwrap() < index_file_length {
-            // read length of command
-            reader.read_exact(&mut length_buffer)?;
-            let offset = reader.seek(SeekFrom::Current(0)).unwrap();
-            let bytes_to_read: u64 = unsafe { std::mem::transmute(length_buffer) };
-            let mut command_buffer: Vec<u8> = vec![0; bytes_to_read as usize];
-            // read command
-            reader.read_exact(&mut command_buffer)?;
-            let command: Command = bincode::deserialize(&command_buffer)?;
-            // save command to map
-            if command.is_remove() {
-                map.remove(command.key);
-            } else {
-                map.insert(
-                    String::from(command.key),
-                    LogPointer::write(offset, &command),
-                );
+
+        for entry in std::fs::read_dir(&database_path)? {
+            let entry = entry?;
+            let file_name = &entry.file_name().into_string().unwrap();
+            if !file_name.ends_with(FILE_SUFFIX) {
+                continue;
+            }
+            println!("Opening file: {}", entry.path().display());
+            logs.insert(entry.path());
+            let file = std::fs::OpenOptions::new().read(true).open(entry.path())?;
+            let file_length = file.metadata().unwrap().len();
+            let mut reader = BufReader::new(file);
+            let mut command_length_buffer = [0; 8];
+            // read
+            while reader.seek(SeekFrom::Current(0)).unwrap() < file_length {
+                reader.read_exact(&mut command_length_buffer)?;
+                let offset = reader.seek(SeekFrom::Current(0)).unwrap();
+                let command_length: u64 = u64::from_be_bytes(command_length_buffer);
+                let mut command_buffer: Vec<u8> = vec![0; command_length as usize];
+                reader.read_exact(&mut command_buffer)?;
+                let command: Command = bincode::deserialize(&command_buffer)?;
+                if command.is_remove() {
+                    map.remove(command.key);
+                } else {
+                    map.insert(
+                        String::from(command.key),
+                        LogPointer::write(entry.path(), offset, &command),
+                    );
+                }
             }
         }
 
         Ok(KvStore {
             map,
-            directory: path,
+            directory: database_path,
+            logs,
         })
     }
 
@@ -235,27 +240,45 @@ impl KvStore {
     ///
     /// If the key already exists, the previous value will be overwritten
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        println!("Set({}, {})", key, value);
         // create a value representing the `set` command, containing key and value
         let command = Command::insert(&key, &value);
 
         // Serialize the `Command` to a String
         let command_buffer = bincode::serialize(&command)?;
-        let command_buffer_length_buffer =
-            unsafe { std::mem::transmute::<usize, [u8; 8]>(command_buffer.len()).to_vec() };
+        let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
 
         // Append serialized command to log file
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(self.directory.join(ACTIVE_FILE))?;
+        let active_path = self.directory.join(ACTIVE_FILE);
+        let mut file = if self.logs.insert(self.directory.join(ACTIVE_FILE)) {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&active_path)?
+        } else {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&active_path)?
+        };
         let offset = file.metadata().unwrap().len() + 8;
         file.write(&command_buffer_length_buffer)?;
         file.write(&command_buffer)?;
         file.flush()?;
 
         // Add command to hashmap as log pointer
-        self.map
-            .insert(key.clone(), LogPointer::write(offset, &command));
+        self.map.insert(
+            key.clone(),
+            LogPointer::write(active_path, offset, &command),
+        );
         // return () if successful
+
+        if offset > MAX_LOG_FILE_SIZE {
+            println!(
+                "Bytes:{} -> Compacting index database",
+                file.metadata().unwrap().len()
+            );
+            self.compact()?;
+        }
         Ok(())
     }
 
@@ -273,7 +296,7 @@ impl KvStore {
         //   Find the value from the file
         let file = std::fs::OpenOptions::new()
             .read(true)
-            .open(self.directory.join(ACTIVE_FILE))?;
+            .open(&log_pointer.file_path)?;
         let mut reader = BufReader::new(file);
         reader.seek(SeekFrom::Start(log_pointer.value_position))?;
         let mut handle = reader.take(log_pointer.value_length);
@@ -303,8 +326,7 @@ impl KvStore {
         //   append the serialized command to the log
         let mut file = self.get_index_file()?;
         let command_buffer = bincode::serialize(&command)?;
-        let command_buffer_length_buffer =
-            unsafe { std::mem::transmute::<usize, [u8; 8]>(command_buffer.len()).to_vec() };
+        let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
         file.write(&command_buffer_length_buffer)?;
         file.write(&command_buffer)?;
         file.flush()?;
@@ -319,7 +341,53 @@ impl KvStore {
             .read(true)
             .write(true)
             .append(true)
+            .create(true)
             .open(self.directory.join(ACTIVE_FILE))?;
         Ok(file)
+    }
+
+    fn generate_log_file_name(&self) -> String {
+        format!("log_{}.database", self.logs.len())
+    }
+
+    fn compact(&mut self) -> Result<()> {
+        // create compact file
+        let index_path = Path::new(&self.directory).join(ACTIVE_FILE);
+        let compact_path = Path::new(&self.directory).join(COMPACT_FILE);
+        let mut compact_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&compact_path)?;
+
+        println!("Open compact file: {} ", compact_path.display());
+        for (key, pointer) in &self.map {
+            if pointer.file_path.ne(&index_path) {
+                continue;
+            }
+            let value = self.get(key.clone())?;
+            if value.is_none() {
+                return Err(KvError::Compact(CustomError::new(
+                    "All keys must point to values",
+                )));
+            }
+            let value = value.unwrap();
+            let command = Command::insert(&key, &value);
+            let command_buffer = bincode::serialize(&command)?;
+            let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
+            compact_file.write(&command_buffer_length_buffer)?;
+            compact_file.write(&command_buffer)?;
+        }
+        compact_file.flush()?;
+        println!("Flushed to compact file");
+
+        let log_path = Path::new(&self.directory).join(self.generate_log_file_name());
+        std::fs::rename(&compact_path, log_path)?;
+        std::fs::remove_file(&index_path)?;
+        self.logs.remove(&index_path);
+        self.logs.insert(compact_path);
+        println!("Finished");
+
+        Ok(())
     }
 }

@@ -58,6 +58,5 @@ fn main() -> Result<()> {
             };
             Ok(())
         }
-        _ => unreachable!(),
     }
 }
