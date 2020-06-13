@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use std::error;
 use std::fmt;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::path::PathBuf;
-use std::result;
+use std::{result, string::FromUtf8Error};
 
 #[derive(Debug)]
 pub struct CustomError {
@@ -38,10 +38,14 @@ impl error::Error for CustomError {
 pub enum KvError {
     /// The `General` error is used when we don't know the specific error that was caused
     Io(io::Error),
-    /// The `Json` error is used to capture an error triggered by serde_json
-    Json(serde_json::error::Error),
+    /// The `Serialize` error is used to capture an error triggered by serde_bincode
+    Serialize(bincode::ErrorKind),
     /// The `KeyNotFound` is used when searching for a key in the database can't be found
     KeyNotFound(CustomError),
+    /// The `Parse` error is used to trigger an error when parsing database files
+    Parse(CustomError),
+    /// The `Decrypt` error is used to throw an error when trying to get a value from our log file
+    Decrypt(FromUtf8Error),
 }
 
 /// `Result` is a error helper for `KvError`
@@ -51,8 +55,10 @@ impl fmt::Display for KvError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             KvError::Io(ref err) => write!(f, "File Not Found: {}", err),
-            KvError::Json(ref err) => write!(f, "Json Err: {}", err),
-            KvError::KeyNotFound(ref _err) => write!(f, "Key not found"),
+            KvError::Serialize(ref err) => write!(f, "Json Err: {}", err),
+            KvError::KeyNotFound(ref err) => write!(f, "KeyNotFound Err: {}", err),
+            KvError::Parse(ref err) => write!(f, "Prase Err: {}", err),
+            KvError::Decrypt(ref err) => write!(f, "Decrypt Err: {}", err),
         }
     }
 }
@@ -61,17 +67,20 @@ impl error::Error for KvError {
     fn description(&self) -> &str {
         match *self {
             KvError::Io(ref err) => err.description(),
-            KvError::Json(ref err) => err.description(),
-            // KvError::KeyNotFound(ref err) => err.description(),
-            KvError::KeyNotFound(ref _err) => "Key not found",
+            KvError::Serialize(ref err) => err.description(),
+            KvError::KeyNotFound(ref err) => err.description(),
+            KvError::Parse(ref err) => err.description(),
+            KvError::Decrypt(ref err) => err.description(),
         }
     }
 
     fn cause(&self) -> Option<&dyn error::Error> {
         match *self {
             KvError::Io(ref err) => Some(err),
-            KvError::Json(ref err) => Some(err),
+            KvError::Serialize(ref err) => Some(err),
             KvError::KeyNotFound(ref err) => Some(err),
+            KvError::Parse(ref err) => Some(err),
+            KvError::Decrypt(ref err) => Some(err),
         }
     }
 }
@@ -82,40 +91,69 @@ impl From<io::Error> for KvError {
     }
 }
 
-impl From<serde_json::error::Error> for KvError {
-    fn from(err: serde_json::error::Error) -> KvError {
-        KvError::Json(err)
+impl From<bincode::ErrorKind> for KvError {
+    fn from(err: bincode::ErrorKind) -> KvError {
+        KvError::Serialize(err)
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct Command {
-    key: String,
-    value: Option<String>,
-    remove: bool,
+impl From<std::boxed::Box<bincode::ErrorKind>> for KvError {
+    fn from(err: std::boxed::Box<bincode::ErrorKind>) -> KvError {
+        KvError::Serialize(*err)
+    }
 }
 
-impl Command {
-    pub fn insert(key: String, value: String) -> Command {
+impl From<FromUtf8Error> for KvError {
+    fn from(err: FromUtf8Error) -> KvError {
+        KvError::Decrypt(err)
+    }
+}
+
+#[derive(Default, Deserialize, Serialize, Debug)]
+struct Command<'a> {
+    value: Option<&'a str>,
+    key: &'a str,
+}
+
+impl<'a> Command<'a> {
+    pub fn insert(key: &'a str, value: &'a str) -> Command<'a> {
         Command {
             key,
             value: Some(value),
-            remove: false,
         }
     }
 
-    pub fn remove(key: String) -> Command {
-        Command {
-            key,
-            value: None,
-            remove: true,
-        }
+    pub fn remove(key: &'a str) -> Command<'a> {
+        Command { key, value: None }
+    }
+
+    pub fn is_remove(&self) -> bool {
+        self.value.is_none()
+    }
+
+    pub fn get_value_length(&self) -> u64 {
+        self.value.unwrap().chars().count() as u64
     }
 }
 
-impl std::string::ToString for Command {
-    fn to_string(&self) -> String {
-        serde_json::to_string(self).unwrap()
+#[derive(Debug)]
+struct LogPointer {
+    value_length: u64,
+    value_position: u64,
+}
+
+const BINCODE_STRING_LENGTH_OFFSET: u64 = 8;
+const BINCODE_STRING_OPTION_OFFSET: u64 = 1;
+const BINCODE_STRING_OFFSET: u64 = BINCODE_STRING_LENGTH_OFFSET + BINCODE_STRING_OPTION_OFFSET;
+
+impl LogPointer {
+    pub fn write(offset: u64, command: &Command) -> LogPointer {
+        let value_length = command.get_value_length();
+        let value_position = offset + BINCODE_STRING_OFFSET;
+        LogPointer {
+            value_length,
+            value_position,
+        }
     }
 }
 
@@ -138,7 +176,7 @@ impl std::string::ToString for Command {
 #[derive(Default)]
 pub struct KvStore {
     directory: PathBuf,
-    map: HashMap<String, String>,
+    map: HashMap<String, LogPointer>,
 }
 
 const ACTIVE_FILE: &'static str = "index.database";
@@ -161,18 +199,32 @@ impl KvStore {
             .write(true)
             .create(true)
             .open(index_path)?;
-        let reader = BufReader::new(index_file);
-        let mut map: HashMap<String, String> = HashMap::new();
-        reader
-            .lines()
-            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
-            .for_each(|command: Command| {
-                if command.remove {
-                    map.remove(&command.key);
-                } else {
-                    map.insert(command.key, command.value.unwrap());
-                }
-            });
+
+        // https://doc.rust-lang.org/beta/std/io/trait.Read.html#method.chain
+        let index_file_length = index_file.metadata().unwrap().len();
+        let mut reader = BufReader::new(index_file);
+        let mut map = HashMap::new();
+        let mut length_buffer = [0; 8];
+        while reader.seek(SeekFrom::Current(0)).unwrap() < index_file_length {
+            // read length of command
+            reader.read_exact(&mut length_buffer)?;
+            let offset = reader.seek(SeekFrom::Current(0)).unwrap();
+            let bytes_to_read: u64 = unsafe { std::mem::transmute(length_buffer) };
+            let mut command_buffer: Vec<u8> = vec![0; bytes_to_read as usize];
+            // read command
+            reader.read_exact(&mut command_buffer)?;
+            let command: Command = bincode::deserialize(&command_buffer)?;
+            // save command to map
+            if command.is_remove() {
+                map.remove(command.key);
+            } else {
+                map.insert(
+                    String::from(command.key),
+                    LogPointer::write(offset, &command),
+                );
+            }
+        }
+
         Ok(KvStore {
             map,
             directory: path,
@@ -183,65 +235,91 @@ impl KvStore {
     ///
     /// If the key already exists, the previous value will be overwritten
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.map.insert(key.clone(), value.clone());
-        let command = Command::insert(key, value);
-        self.append_to_database(command)
         // create a value representing the `set` command, containing key and value
+        let command = Command::insert(&key, &value);
+
         // Serialize the `Command` to a String
+        let command_buffer = bincode::serialize(&command)?;
+        let command_buffer_length_buffer =
+            unsafe { std::mem::transmute::<usize, [u8; 8]>(command_buffer.len()).to_vec() };
+
         // Append serialized command to log file
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(self.directory.join(ACTIVE_FILE))?;
+        let offset = file.metadata().unwrap().len() + 8;
+        file.write(&command_buffer_length_buffer)?;
+        file.write(&command_buffer)?;
+        file.flush()?;
+
+        // Add command to hashmap as log pointer
+        self.map
+            .insert(key.clone(), LogPointer::write(offset, &command));
         // return () if successful
-        // return KvError on fail
+        Ok(())
     }
 
     /// Gets the string value of a given string key.
     ///
     /// Returns `None` if the given key does not exist.
     pub fn get(&self, key: String) -> Result<Option<String>> {
-        if self.map.get(&key).is_none() {
-            return Ok(None);
-        }
-        // Read entire log, one command at a time, record affected key and file
-        // offset of the command to an in-memory key -> log pointer map
         // Checks the map for log pointer
-        // If no log pointer found, throw `KeyNotFound` error
+        let log_pointer = match self.map.get(&key) {
+            Some(v) => v,
+            // If no log pointer found, throw `KeyNotFound` error
+            None => return Ok(None),
+        };
         // If success
+        //   Find the value from the file
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(self.directory.join(ACTIVE_FILE))?;
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(log_pointer.value_position))?;
+        let mut handle = reader.take(log_pointer.value_length);
+        let mut buffer = vec![0; log_pointer.value_length as usize];
+        handle.read(&mut buffer[..])?;
         //   Deserialize the command to get the last recorded value of the key
-        //   Print the value to stdout
-        Ok(self.map.get(&key).cloned())
+        Ok(Some(String::from_utf8(buffer)?))
     }
 
     /// Remove a given key.
     pub fn remove(&mut self, key: String) -> Result<()> {
-        // convert to map_err()
-        self.key_exists_check(&key)?;
-        // Read entire log
-        // Check the map if given key exists
+        // Checks the map for log pointer
         // If no log pointer found, throw `KeyNotFound` error
-        let cmd = Command::remove(key.clone());
-        self.map.remove(&key);
-        self.append_to_database(cmd)
+        match self.map.get(&key) {
+            Some(v) => v,
+            // If no log pointer found, throw `KeyNotFound` error
+            None => {
+                return Err(KvError::KeyNotFound(CustomError::new(
+                    "Key could not be found inside database",
+                )))
+            }
+        };
         // If success
         //   create a value representing the "rm" command, containing it's key
+        let command = Command::remove(&key);
+
         //   append the serialized command to the log
+        let mut file = self.get_index_file()?;
+        let command_buffer = bincode::serialize(&command)?;
+        let command_buffer_length_buffer =
+            unsafe { std::mem::transmute::<usize, [u8; 8]>(command_buffer.len()).to_vec() };
+        file.write(&command_buffer_length_buffer)?;
+        file.write(&command_buffer)?;
+        file.flush()?;
+        self.map.remove(&key);
+
         //   return (), exit
+        Ok(())
     }
 
-    fn append_to_database(&self, command: Command) -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
+    fn get_index_file(&self) -> Result<File> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .append(true)
-            .open(self.directory.join(ACTIVE_FILE))
-            .unwrap();
-        writeln!(file, "{}", command.to_string())?;
-        return Ok(());
-    }
-
-    fn key_exists_check(&self, key: &str) -> Result<()> {
-        if self.map.get(key).is_none() {
-            return Err(KvError::KeyNotFound(CustomError::new(
-                "Key could not be found inside database",
-            )));
-        }
-        Ok(())
+            .open(self.directory.join(ACTIVE_FILE))?;
+        Ok(file)
     }
 }
