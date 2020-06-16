@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 use std::{result, string::FromUtf8Error};
 
 #[derive(Debug)]
@@ -107,18 +108,24 @@ impl From<FromUtf8Error> for KvError {
 struct Command<'a> {
     value: Option<&'a str>,
     key: &'a str,
+    timestamp: u128,
 }
 
 impl<'a> Command<'a> {
-    pub fn insert(key: &'a str, value: &'a str) -> Command<'a> {
+    pub fn insert(key: &'a str, value: &'a str, timestamp: u128) -> Command<'a> {
         Command {
             key,
             value: Some(value),
+            timestamp,
         }
     }
 
-    pub fn remove(key: &'a str) -> Command<'a> {
-        Command { key, value: None }
+    pub fn remove(key: &'a str, timestamp: u128) -> Command<'a> {
+        Command {
+            key,
+            value: None,
+            timestamp,
+        }
     }
 
     pub fn is_remove(&self) -> bool {
@@ -135,6 +142,7 @@ struct LogPointer {
     file_path: PathBuf,
     value_length: u64,
     value_position: u64,
+    timestamp: u128,
 }
 
 const BINCODE_STRING_LENGTH_OFFSET: u64 = 8;
@@ -149,6 +157,7 @@ impl LogPointer {
             file_path,
             value_length,
             value_position,
+            timestamp: command.timestamp,
         }
     }
 }
@@ -204,7 +213,7 @@ impl KvStore {
             if !file_name.ends_with(FILE_SUFFIX) {
                 continue;
             }
-            println!("Opening file: {}", entry.path().display());
+
             logs.insert(entry.path());
             let file = std::fs::OpenOptions::new().read(true).open(entry.path())?;
             let file_length = file.metadata().unwrap().len();
@@ -218,13 +227,25 @@ impl KvStore {
                 let mut command_buffer: Vec<u8> = vec![0; command_length as usize];
                 reader.read_exact(&mut command_buffer)?;
                 let command: Command = bincode::deserialize(&command_buffer)?;
-                if command.is_remove() {
-                    map.remove(command.key);
-                } else {
+
+                let pointer = map.get(command.key);
+                if pointer.is_none() {
                     map.insert(
                         String::from(command.key),
                         LogPointer::write(entry.path(), offset, &command),
                     );
+                } else {
+                    let pointer = pointer.unwrap();
+                    if pointer.timestamp < command.timestamp {
+                        if command.is_remove() {
+                            map.remove(command.key);
+                        } else {
+                            map.insert(
+                                String::from(command.key),
+                                LogPointer::write(entry.path(), offset, &command),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -240,9 +261,8 @@ impl KvStore {
     ///
     /// If the key already exists, the previous value will be overwritten
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        println!("Set({}, {})", key, value);
         // create a value representing the `set` command, containing key and value
-        let command = Command::insert(&key, &value);
+        let command = Command::insert(&key, &value, self.now());
 
         // Serialize the `Command` to a String
         let command_buffer = bincode::serialize(&command)?;
@@ -273,10 +293,6 @@ impl KvStore {
         // return () if successful
 
         if offset > MAX_LOG_FILE_SIZE {
-            println!(
-                "Bytes:{} -> Compacting index database",
-                file.metadata().unwrap().len()
-            );
             self.compact()?;
         }
         Ok(())
@@ -321,7 +337,7 @@ impl KvStore {
         };
         // If success
         //   create a value representing the "rm" command, containing it's key
-        let command = Command::remove(&key);
+        let command = Command::remove(&key, self.now());
 
         //   append the serialized command to the log
         let mut file = self.get_index_file()?;
@@ -350,9 +366,15 @@ impl KvStore {
         format!("log_{}.database", self.logs.len())
     }
 
+    fn now(&self) -> u128 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
     fn compact(&mut self) -> Result<()> {
         // create compact file
-        let index_path = Path::new(&self.directory).join(ACTIVE_FILE);
         let compact_path = Path::new(&self.directory).join(COMPACT_FILE);
         let mut compact_file = std::fs::OpenOptions::new()
             .write(true)
@@ -360,11 +382,7 @@ impl KvStore {
             .truncate(true)
             .open(&compact_path)?;
 
-        println!("Open compact file: {} ", compact_path.display());
-        for (key, pointer) in &self.map {
-            if pointer.file_path.ne(&index_path) {
-                continue;
-            }
+        for (key, _) in &self.map {
             let value = self.get(key.clone())?;
             if value.is_none() {
                 return Err(KvError::Compact(CustomError::new(
@@ -372,21 +390,24 @@ impl KvStore {
                 )));
             }
             let value = value.unwrap();
-            let command = Command::insert(&key, &value);
+            let command = Command::insert(&key, &value, self.now());
             let command_buffer = bincode::serialize(&command)?;
             let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
             compact_file.write(&command_buffer_length_buffer)?;
             compact_file.write(&command_buffer)?;
         }
         compact_file.flush()?;
-        println!("Flushed to compact file");
 
         let log_path = Path::new(&self.directory).join(self.generate_log_file_name());
-        std::fs::rename(&compact_path, log_path)?;
-        std::fs::remove_file(&index_path)?;
-        self.logs.remove(&index_path);
-        self.logs.insert(compact_path);
-        println!("Finished");
+        std::fs::rename(&compact_path, &log_path)?;
+        for entry in std::fs::read_dir(&self.directory)? {
+            let entry = entry?;
+            if entry.path().ne(&log_path) {
+                std::fs::remove_file(&entry.path())?;
+            }
+        }
+        self.logs.clear();
+        self.logs.insert(log_path);
 
         Ok(())
     }
