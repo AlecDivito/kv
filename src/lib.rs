@@ -1,8 +1,19 @@
 #![deny(missing_docs)]
 //! A simple key/value store.
+//!
 
-pub use kv::KvError;
-pub use kv::KvStore;
-pub use kv::Result;
+#[macro_use]
+extern crate log;
 
-mod kv;
+pub use client::KvsClient;
+pub use engines::{KvStore, KvsEngine, SledKvsEngine};
+pub use error::{KvsError, Result};
+pub use server::KvsServer;
+
+pub use error::{GenericError, KvError, Result};
+
+mod client;
+mod common;
+mod engines;
+mod error;
+mod server;

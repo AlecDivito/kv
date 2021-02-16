@@ -3,6 +3,8 @@
 This document is a small summary of the following paper:
 [A log-Structured Hash Table for Fast Key/Value Data](https://github.com/basho/bitcask/blob/develop/doc/bitcask-intro.pdf)
 
+Bitcask repository is hosted on github. To read it go [here](https://github.com/basho/bitcask)
+
 ## Abstract
 
 Bitcask is a database Server that writes to files. Where the

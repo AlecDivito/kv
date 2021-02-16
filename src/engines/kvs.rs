@@ -1,3 +1,4 @@
+use crate::engines::KvsEngine;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::error;
@@ -257,101 +258,6 @@ impl KvStore {
         })
     }
 
-    /// Sets the value of a string key to a string.
-    ///
-    /// If the key already exists, the previous value will be overwritten
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        // create a value representing the `set` command, containing key and value
-        let command = Command::insert(&key, &value, self.now());
-
-        // Serialize the `Command` to a String
-        let command_buffer = bincode::serialize(&command)?;
-        let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
-
-        // Append serialized command to log file
-        let active_path = self.directory.join(ACTIVE_FILE);
-        let mut file = if self.logs.insert(self.directory.join(ACTIVE_FILE)) {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&active_path)?
-        } else {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&active_path)?
-        };
-        let offset = file.metadata().unwrap().len() + 8;
-        file.write(&command_buffer_length_buffer)?;
-        file.write(&command_buffer)?;
-        file.flush()?;
-
-        // Add command to hashmap as log pointer
-        self.map.insert(
-            key.clone(),
-            LogPointer::write(active_path, offset, &command),
-        );
-        // return () if successful
-
-        if offset > MAX_LOG_FILE_SIZE {
-            self.compact()?;
-        }
-        Ok(())
-    }
-
-    /// Gets the string value of a given string key.
-    ///
-    /// Returns `None` if the given key does not exist.
-    pub fn get(&self, key: String) -> Result<Option<String>> {
-        // Checks the map for log pointer
-        let log_pointer = match self.map.get(&key) {
-            Some(v) => v,
-            // If no log pointer found, throw `KeyNotFound` error
-            None => return Ok(None),
-        };
-        // If success
-        //   Find the value from the file
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .open(&log_pointer.file_path)?;
-        let mut reader = BufReader::new(file);
-        reader.seek(SeekFrom::Start(log_pointer.value_position))?;
-        let mut handle = reader.take(log_pointer.value_length);
-        let mut buffer = vec![0; log_pointer.value_length as usize];
-        handle.read(&mut buffer[..])?;
-        //   Deserialize the command to get the last recorded value of the key
-        Ok(Some(String::from_utf8(buffer)?))
-    }
-
-    /// Remove a given key.
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        // Checks the map for log pointer
-        // If no log pointer found, throw `KeyNotFound` error
-        match self.map.get(&key) {
-            Some(v) => v,
-            // If no log pointer found, throw `KeyNotFound` error
-            None => {
-                return Err(KvError::KeyNotFound(CustomError::new(
-                    "Key could not be found inside database",
-                )))
-            }
-        };
-        // If success
-        //   create a value representing the "rm" command, containing it's key
-        let command = Command::remove(&key, self.now());
-
-        //   append the serialized command to the log
-        let mut file = self.get_index_file()?;
-        let command_buffer = bincode::serialize(&command)?;
-        let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
-        file.write(&command_buffer_length_buffer)?;
-        file.write(&command_buffer)?;
-        file.flush()?;
-        self.map.remove(&key);
-
-        //   return (), exit
-        Ok(())
-    }
-
     fn get_index_file(&self) -> Result<File> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -409,6 +315,103 @@ impl KvStore {
         self.logs.clear();
         self.logs.insert(log_path);
 
+        Ok(())
+    }
+}
+
+impl KvsEngine for KvStore {
+    /// Sets the value of a string key to a string.
+    ///
+    /// If the key already exists, the previous value will be overwritten
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        // create a value representing the `set` command, containing key and value
+        let command = Command::insert(&key, &value, self.now());
+
+        // Serialize the `Command` to a String
+        let command_buffer = bincode::serialize(&command)?;
+        let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
+
+        // Append serialized command to log file
+        let active_path = self.directory.join(ACTIVE_FILE);
+        let mut file = if self.logs.insert(self.directory.join(ACTIVE_FILE)) {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&active_path)?
+        } else {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&active_path)?
+        };
+        let offset = file.metadata().unwrap().len() + 8;
+        file.write(&command_buffer_length_buffer)?;
+        file.write(&command_buffer)?;
+        file.flush()?;
+
+        // Add command to hashmap as log pointer
+        self.map.insert(
+            key.clone(),
+            LogPointer::write(active_path, offset, &command),
+        );
+        // return () if successful
+
+        if offset > MAX_LOG_FILE_SIZE {
+            self.compact()?;
+        }
+        Ok(())
+    }
+
+    /// Gets the string value of a given string key.
+    ///
+    /// Returns `None` if the given key does not exist.
+    fn get(&self, key: String) -> Result<Option<String>> {
+        // Checks the map for log pointer
+        let log_pointer = match self.map.get(&key) {
+            Some(v) => v,
+            // If no log pointer found, throw `KeyNotFound` error
+            None => return Ok(None),
+        };
+        // If success
+        //   Find the value from the file
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&log_pointer.file_path)?;
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(log_pointer.value_position))?;
+        let mut handle = reader.take(log_pointer.value_length);
+        let mut buffer = vec![0; log_pointer.value_length as usize];
+        handle.read(&mut buffer[..])?;
+        //   Deserialize the command to get the last recorded value of the key
+        Ok(Some(String::from_utf8(buffer)?))
+    }
+
+    /// Remove a given key.
+    fn remove(&mut self, key: String) -> Result<()> {
+        // Checks the map for log pointer
+        // If no log pointer found, throw `KeyNotFound` error
+        match self.map.get(&key) {
+            Some(v) => v,
+            // If no log pointer found, throw `KeyNotFound` error
+            None => {
+                return Err(KvError::KeyNotFound(CustomError::new(
+                    "Key could not be found inside database",
+                )))
+            }
+        };
+        // If success
+        //   create a value representing the "rm" command, containing it's key
+        let command = Command::remove(&key, self.now());
+
+        //   append the serialized command to the log
+        let mut file = self.get_index_file()?;
+        let command_buffer = bincode::serialize(&command)?;
+        let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
+        file.write(&command_buffer_length_buffer)?;
+        file.write(&command_buffer)?;
+        file.flush()?;
+        self.map.remove(&key);
+
+        //   return (), exit
         Ok(())
     }
 }
