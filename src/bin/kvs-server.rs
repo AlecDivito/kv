@@ -69,7 +69,7 @@ fn run(opt: Opt) -> Result<()> {
     fs::write(current_dir()?.join("engine"), format!("{}", engine))?;
 
     match engine {
-        Engine::kvs => run_with_engine(KvStore::open(current_dir()?)?, opt.addr),
+        Engine::kvs => run_with_engine(KvStore::open("./.temp" /* current_dir()? */)?, opt.addr),
         Engine::sled => run_with_engine(SledKvsEngine::new(sled::open(current_dir()?)?), opt.addr),
     }
 }

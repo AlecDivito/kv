@@ -64,6 +64,15 @@ impl LogPointer {
             timestamp: command.timestamp,
         }
     }
+
+    pub fn rewrite(&mut self, file_path: PathBuf, offset: u64, command: &Command) {
+        let value_length = command.get_value_length();
+        let value_position = offset + BINCODE_STRING_OFFSET;
+        self.file_path = file_path;
+        self.value_length = value_length;
+        self.value_position = value_position;
+        self.timestamp = command.timestamp;
+    }
 }
 
 /// The `KvStore` stores string key/value pairs.
@@ -75,6 +84,13 @@ pub struct KvStore {
     directory: PathBuf,
     map: HashMap<String, LogPointer>,
     logs: HashSet<PathBuf>,
+}
+
+fn now() -> u128 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 const FILE_SUFFIX: &'static str = ".database";
@@ -163,13 +179,6 @@ impl KvStore {
         format!("log_{}.database", self.logs.len())
     }
 
-    fn now(&self) -> u128 {
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    }
-
     fn compact(&mut self) -> Result<()> {
         // create compact file
         let compact_path = Path::new(&self.directory).join(COMPACT_FILE);
@@ -179,7 +188,16 @@ impl KvStore {
             .truncate(true)
             .open(&compact_path)?;
 
-        for (key, _) in self.map.borrow() {
+        // Create the new log file name
+        let new_log_path = Path::new(&self.directory).join(self.generate_log_file_name());
+        let mut offset = 8; // keep the offset to the start of the next record
+
+        // Create new map
+        let mut map = HashMap::new();
+
+        // loop over current keys and write them all to the compact file
+        for key in self.map.keys() {
+            // try and get the value from the database
             let value = self.get(key.clone())?;
             if value.is_none() {
                 return Err(KvError::Compact(GenericError::new(
@@ -187,26 +205,48 @@ impl KvStore {
                 )));
             }
             let value = value.unwrap();
-            let command = Command::insert(&key, &value, self.now());
+            // create the command to insert into database
+            let command = Command::insert(&key, &value, now());
             let command_buffer = bincode::serialize(&command)?;
             let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
+            map.insert(key.clone(), LogPointer::write(new_log_path.clone(), offset, &command));
             compact_file.write(&command_buffer_length_buffer)?;
             compact_file.write(&command_buffer)?;
+            offset = offset + command_buffer.len() as u64 + command_buffer_length_buffer.len() as u64;
         }
         compact_file.flush()?;
 
-        let log_path = Path::new(&self.directory).join(self.generate_log_file_name());
-        std::fs::rename(&compact_path, &log_path)?;
+        // rename the compact file into the new log file
+        std::fs::rename(&compact_path, &new_log_path)?;
+
+        // delete old files
         for entry in std::fs::read_dir(&self.directory)? {
             let entry = entry?;
-            if entry.path().ne(&log_path) {
+            if entry.path().ne(&new_log_path) {
                 std::fs::remove_file(&entry.path())?;
             }
         }
         self.logs.clear();
-        self.logs.insert(log_path);
-
+        self.logs.insert(new_log_path);
+        self.map = map;
         Ok(())
+    }
+
+    fn secret_get(&mut self, log_pointer: &mut LogPointer) -> Result<Option<String>> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&log_pointer.file_path)?;
+        let mut reader = BufReader::new(file);
+        reader.seek(SeekFrom::Start(log_pointer.value_position))?;
+        let mut handle = reader.take(log_pointer.value_length);
+        let mut buffer = vec![0; log_pointer.value_length as usize];
+        handle.read(&mut buffer[..])?;
+        //   Deserialize the command to get the last recorded value of the key
+        Ok(
+            Some(
+                String::from_utf8(buffer)?
+            )
+        )
     }
 }
 
@@ -216,7 +256,7 @@ impl KvsEngine for KvStore {
     /// If the key already exists, the previous value will be overwritten
     fn set(&mut self, key: String, value: String) -> Result<()> {
         // create a value representing the `set` command, containing key and value
-        let command = Command::insert(&key, &value, self.now());
+        let command = Command::insert(&key, &value, now());
 
         // Serialize the `Command` to a String
         let command_buffer = bincode::serialize(&command)?;
@@ -275,10 +315,13 @@ impl KvsEngine for KvStore {
         handle.read(&mut buffer[..])?;
         //   Deserialize the command to get the last recorded value of the key
         let temp = buffer.clone();
+        if let Err(_) = String::from_utf8(temp.clone()) {
+            info!("{}", format!("Can't convert key {} to value {:?} to utf8 with log pointer {:?}", keyy, temp, log_pointer));
+        }
         Ok(
             Some(
                 String::from_utf8(buffer)
-                    .map_err(|_| KvError::StringError(format!("Can't convert key {} to value {:?} to utf8", keyy, temp).into()))?
+                    .map_err(|_| KvError::StringError(format!("Can't convert key {} to value {:?} to utf8 with log pointer {:?}", keyy, temp, log_pointer).into()))?
             )
         )
         
@@ -299,7 +342,7 @@ impl KvsEngine for KvStore {
         };
         // If success
         //   create a value representing the "rm" command, containing it's key
-        let command = Command::remove(&key, self.now());
+        let command = Command::remove(&key, now());
 
         //   append the serialized command to the log
         let mut file = self.get_index_file()?;
