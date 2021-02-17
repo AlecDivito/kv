@@ -1,10 +1,7 @@
-#[macro_use]
-extern crate log;
-#[macro_use]
-extern crate clap;
-
+use clap::arg_enum;
 use kvs::*;
 use log::LevelFilter;
+use log::{error, info, warn};
 use std::env::current_dir;
 use std::fs;
 use std::net::SocketAddr;
@@ -21,7 +18,7 @@ struct Opt {
         long,
         help = "Sets the listening address",
         value_name = "IP:PORT",
-        raw(default_value = "DEFAULT_LISTENING_ADDRESS"),
+        default_value = DEFAULT_LISTENING_ADDRESS,
         parse(try_from_str)
     )]
     addr: SocketAddr,
@@ -29,7 +26,7 @@ struct Opt {
         long,
         help = "Sets the storage engine",
         value_name = "ENGINE-NAME",
-        raw(possible_values = "&Engine::variants()")
+        possible_values = &Engine::variants()
     )]
     engine: Option<Engine>,
 }
@@ -73,15 +70,12 @@ fn run(opt: Opt) -> Result<()> {
 
     match engine {
         Engine::kvs => run_with_engine(KvStore::open(current_dir()?)?, opt.addr),
-        Engine::sled => run_with_engine(
-            SledKvsEngine::new(sled::Db::start_default(current_dir()?)?),
-            opt.addr,
-        ),
+        Engine::sled => run_with_engine(SledKvsEngine::new(sled::open(current_dir()?)?), opt.addr),
     }
 }
 
 fn run_with_engine<E: KvsEngine>(engine: E, addr: SocketAddr) -> Result<()> {
-    let server = KvsServer::new(engine);
+    let server = KvServer::new(engine);
     server.run(addr)
 }
 

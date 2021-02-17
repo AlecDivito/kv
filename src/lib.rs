@@ -5,12 +5,10 @@
 #[macro_use]
 extern crate log;
 
-pub use client::KvsClient;
+pub use client::KvClient;
 pub use engines::{KvStore, KvsEngine, SledKvsEngine};
-pub use error::{KvsError, Result};
-pub use server::KvsServer;
-
-pub use error::{GenericError, KvError, Result};
+pub use error::{ KvError, GenericError, Result};
+pub use server::KvServer;
 
 mod client;
 mod common;

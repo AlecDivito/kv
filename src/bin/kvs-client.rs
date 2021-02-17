@@ -1,5 +1,5 @@
 use clap::AppSettings;
-use kvs::{KvsClient, Result};
+use kvs::{KvClient, Result};
 use std::net::SocketAddr;
 use std::process::exit;
 use structopt::StructOpt;
@@ -10,9 +10,9 @@ const ADDRESS_FORMAT: &str = "IP:PORT";
 #[derive(StructOpt, Debug)]
 #[structopt(
     name = "kvs-client",
-    raw(global_settings = "&[\
-                           AppSettings::DisableHelpSubcommand,\
-                           AppSettings::VersionlessSubcommands]")
+    global_settings = &[
+        AppSettings::DisableHelpSubcommand,
+        AppSettings::VersionlessSubcommands]
 )]
 struct Opt {
     #[structopt(subcommand)]
@@ -28,8 +28,8 @@ enum Command {
         #[structopt(
             long,
             help = "Sets the server address",
-            raw(value_name = "ADDRESS_FORMAT"),
-            raw(default_value = "DEFAULT_LISTENING_ADDRESS"),
+            value_name = ADDRESS_FORMAT,
+            default_value = DEFAULT_LISTENING_ADDRESS,
             parse(try_from_str)
         )]
         addr: SocketAddr,
@@ -43,8 +43,8 @@ enum Command {
         #[structopt(
             long,
             help = "Sets the server address",
-            raw(value_name = "ADDRESS_FORMAT"),
-            raw(default_value = "DEFAULT_LISTENING_ADDRESS"),
+            value_name = ADDRESS_FORMAT,
+            default_value = DEFAULT_LISTENING_ADDRESS,
             parse(try_from_str)
         )]
         addr: SocketAddr,
@@ -56,8 +56,8 @@ enum Command {
         #[structopt(
             long,
             help = "Sets the server address",
-            raw(value_name = "ADDRESS_FORMAT"),
-            raw(default_value = "DEFAULT_LISTENING_ADDRESS"),
+            value_name = ADDRESS_FORMAT,
+            default_value = DEFAULT_LISTENING_ADDRESS,
             parse(try_from_str)
         )]
         addr: SocketAddr,
@@ -75,7 +75,7 @@ fn main() {
 fn run(opt: Opt) -> Result<()> {
     match opt.command {
         Command::Get { key, addr } => {
-            let mut client = KvsClient::connect(addr)?;
+            let mut client = KvClient::connect(addr)?;
             if let Some(value) = client.get(key)? {
                 println!("{}", value);
             } else {
@@ -83,11 +83,11 @@ fn run(opt: Opt) -> Result<()> {
             }
         }
         Command::Set { key, value, addr } => {
-            let mut client = KvsClient::connect(addr)?;
+            let mut client = KvClient::connect(addr)?;
             client.set(key, value)?;
         }
         Command::Remove { key, addr } => {
-            let mut client = KvsClient::connect(addr)?;
+            let mut client = KvClient::connect(addr)?;
             client.remove(key)?;
         }
     }

@@ -1,109 +1,12 @@
-use crate::engines::KvsEngine;
+use crate::{GenericError, KvError, engines::KvsEngine};
+use super::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::error;
-use std::fmt::{self};
+use std::{borrow::Borrow, collections::{HashMap, HashSet}};
 use std::fs::File;
-use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use std::{result, string::FromUtf8Error};
-
-#[derive(Debug)]
-pub struct CustomError {
-    details: String,
-}
-
-impl CustomError {
-    fn new(msg: &str) -> CustomError {
-        CustomError {
-            details: msg.to_string(),
-        }
-    }
-}
-
-impl fmt::Display for CustomError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.details)
-    }
-}
-
-impl error::Error for CustomError {
-    fn description(&self) -> &str {
-        &self.details
-    }
-}
-
-/// The `kvError` keeps track of the errors that the database runs into
-#[derive(Debug)]
-pub enum KvError {
-    /// The `General` error is used when we don't know the specific error that was caused
-    Io(io::Error),
-    /// The `Serialize` error is used to capture an error triggered by serde_bincode
-    Serialize(bincode::ErrorKind),
-    /// The `KeyNotFound` is used when searching for a key in the database can't be found
-    KeyNotFound(CustomError),
-    /// The `Parse` error is used to trigger an error when parsing database files
-    Parse(CustomError),
-    /// The `Decrypt` error is used to throw an error when trying to get a value from our log file
-    Decrypt(FromUtf8Error),
-    /// The `Compact` error is used when we fail to compact the active log
-    Compact(CustomError),
-}
-
-/// `Result` is a error helper for `KvError`
-pub type Result<T> = result::Result<T, KvError>;
-
-impl fmt::Display for KvError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            KvError::Io(ref err) => write!(f, "File Not Found: {}", err),
-            KvError::Serialize(ref err) => write!(f, "Json Err: {}", err),
-            KvError::KeyNotFound(ref err) => write!(f, "KeyNotFound Err: {}", err),
-            KvError::Parse(ref err) => write!(f, "Prase Err: {}", err),
-            KvError::Decrypt(ref err) => write!(f, "Decrypt Err: {}", err),
-            KvError::Compact(ref err) => write!(f, "Compact Err: {}", err),
-        }
-    }
-}
-
-impl error::Error for KvError {
-    fn cause(&self) -> Option<&dyn error::Error> {
-        match *self {
-            KvError::Io(ref err) => Some(err),
-            KvError::Serialize(ref err) => Some(err),
-            KvError::KeyNotFound(ref err) => Some(err),
-            KvError::Parse(ref err) => Some(err),
-            KvError::Decrypt(ref err) => Some(err),
-            KvError::Compact(ref err) => Some(err),
-        }
-    }
-}
-
-impl From<io::Error> for KvError {
-    fn from(err: io::Error) -> KvError {
-        KvError::Io(err)
-    }
-}
-
-impl From<bincode::ErrorKind> for KvError {
-    fn from(err: bincode::ErrorKind) -> KvError {
-        KvError::Serialize(err)
-    }
-}
-
-impl From<std::boxed::Box<bincode::ErrorKind>> for KvError {
-    fn from(err: std::boxed::Box<bincode::ErrorKind>) -> KvError {
-        KvError::Serialize(*err)
-    }
-}
-
-impl From<FromUtf8Error> for KvError {
-    fn from(err: FromUtf8Error) -> KvError {
-        KvError::Decrypt(err)
-    }
-}
 
 #[derive(Default, Deserialize, Serialize, Debug)]
 struct Command<'a> {
@@ -166,18 +69,6 @@ impl LogPointer {
 /// The `KvStore` stores string key/value pairs.
 ///
 /// Key/value pairs are stored in a `HashMap` in memory and not persisted to disk
-///
-/// Example:
-///
-/// ```rust
-/// # use kvs::{KvStore, KvError, Result};
-/// # fn main() -> Result<()> {
-/// let mut store = KvStore::open("./")?;
-/// store.set("key".to_owned(), "value".to_owned())?;
-/// let val = store.get("key".to_owned())?;
-/// assert_eq!(val, Some("value".to_owned()));
-/// Ok(())
-/// # }
 /// ```
 #[derive(Default)]
 pub struct KvStore {
@@ -288,11 +179,11 @@ impl KvStore {
             .truncate(true)
             .open(&compact_path)?;
 
-        for (key, _) in &self.map {
+        for (key, _) in self.map.borrow() {
             let value = self.get(key.clone())?;
             if value.is_none() {
-                return Err(KvError::Compact(CustomError::new(
-                    "All keys must point to values",
+                return Err(KvError::Compact(GenericError::new(
+                    "All keys must point to values"
                 )));
             }
             let value = value.unwrap();
@@ -319,7 +210,7 @@ impl KvStore {
     }
 }
 
-impl KvsEngine for KvStore {
+impl KvsEngine for KvStore { 
     /// Sets the value of a string key to a string.
     ///
     /// If the key already exists, the previous value will be overwritten
@@ -365,6 +256,7 @@ impl KvsEngine for KvStore {
     ///
     /// Returns `None` if the given key does not exist.
     fn get(&self, key: String) -> Result<Option<String>> {
+        let keyy = key.clone();
         // Checks the map for log pointer
         let log_pointer = match self.map.get(&key) {
             Some(v) => v,
@@ -382,7 +274,14 @@ impl KvsEngine for KvStore {
         let mut buffer = vec![0; log_pointer.value_length as usize];
         handle.read(&mut buffer[..])?;
         //   Deserialize the command to get the last recorded value of the key
-        Ok(Some(String::from_utf8(buffer)?))
+        let temp = buffer.clone();
+        Ok(
+            Some(
+                String::from_utf8(buffer)
+                    .map_err(|_| KvError::StringError(format!("Can't convert key {} to value {:?} to utf8", keyy, temp).into()))?
+            )
+        )
+        
     }
 
     /// Remove a given key.
@@ -393,7 +292,7 @@ impl KvsEngine for KvStore {
             Some(v) => v,
             // If no log pointer found, throw `KeyNotFound` error
             None => {
-                return Err(KvError::KeyNotFound(CustomError::new(
+                return Err(KvError::KeyNotFound(GenericError::new(
                     "Key could not be found inside database",
                 )))
             }
