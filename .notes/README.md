@@ -8,15 +8,44 @@ this [course](https://github.com/pingcap/talent-plan/blob/master/courses/rust/do
 
 ## Chapter 1
 
+[Link to building block](https://github.com/pingcap/talent-plan/blob/master/courses/rust/building-blocks/bb-1.md)
+
 Learning rust and commond line applications. Learn about rusts package
 manager, cargo, as well how to create and test applications.
 
+[Read More](./chapter-1/README.md)
+
 ## Chapter 2
+
+[Link to Building block](https://github.com/pingcap/talent-plan/blob/master/courses/rust/building-blocks/bb-2.md)
 
 This chapter focused on teaching us the use of Log structured storage
 systems. It also went ahead and taught us about handling errors in
 rust (which taught me a lot of new cool things i could do in the
 language).
+
+[Read More](./chapter-2/README.md)
+
+## Chapter 3
+
+[Link to Building block](https://github.com/pingcap/talent-plan/blob/master/courses/rust/building-blocks/bb-3.md)
+
+This chapter focuses on refactoring the project so that it is accessable
+over a server and client tool with a TCP socket. It also jumps into
+comparing your solution to other production systems such as sled.
+Implementation Sled inside of our database and start bench marking it.
+
+[Read More](./chapter-3/README.md)
+
+## Chapter 4
+
+[Link to Building block](https://github.com/pingcap/talent-plan/blob/master/courses/rust/building-blocks/bb-4.md)
+
+This chapter goes over building fearless concurrency using rust and goes over
+some of rusts famous projects that use muilt-threading to improve performance.
+Learn about `std::sync` and build your own thread pool.
+
+[Read More](./chapter-4/README.md)
 
 ### Documentation
 
