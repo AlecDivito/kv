@@ -1,7 +1,7 @@
 use crate::common::{GetResponse, RemoveResponse, Request, SetResponse};
 use crate::{KvError, Result};
 use serde::Deserialize;
-use serde_json::{de::{Deserializer, IoRead}};
+use serde_json::de::{Deserializer, IoRead};
 use std::io::{BufReader, BufWriter, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 
@@ -26,7 +26,7 @@ impl KvClient {
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
         serde_json::to_writer(&mut self.writer, &Request::Get { key })?;
         self.writer.flush()?;
-        let response = GetResponse::deserialize(&mut self.reader)?; 
+        let response = GetResponse::deserialize(&mut self.reader)?;
         match response {
             GetResponse::Ok(value) => Ok(value),
             GetResponse::Err(msg) => Err(KvError::StringError(msg.into())),

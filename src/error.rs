@@ -1,6 +1,8 @@
-use std::{error, string::FromUtf8Error};
-use std::fmt;
 use std::io;
+use std::{error, string::FromUtf8Error};
+use std::{fmt, ops::Deref};
+
+use fmt::Formatter;
 
 /// Generic Error because right now i'm to lazy to implement an actually good
 /// error class
@@ -20,7 +22,9 @@ impl GenericError {
 
 impl Into<GenericError> for &str {
     fn into(self) -> GenericError {
-        GenericError { details: self.to_string() }
+        GenericError {
+            details: self.to_string(),
+        }
     }
 }
 
@@ -31,7 +35,7 @@ impl Into<GenericError> for String {
 }
 
 impl fmt::Display for GenericError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.details)
     }
 }
@@ -71,7 +75,7 @@ pub enum KvError {
 pub type Result<T> = std::result::Result<T, KvError>;
 
 impl fmt::Display for KvError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             KvError::Io(ref err) => write!(f, "File Not Found: {}", err),
             KvError::Serialize(ref err) => write!(f, "Bincode Err: {}", err),
@@ -82,7 +86,7 @@ impl fmt::Display for KvError {
             KvError::Utf8(ref err) => write!(f, "Utf8 Err: {}", err),
             KvError::Compact(ref err) => write!(f, "Compact Err: {}", err),
             KvError::Sled(ref err) => write!(f, "Sled Err: {}", err),
-            KvError::StringError(ref err) => write!(f, "String Error: {}", err)
+            KvError::StringError(ref err) => write!(f, "String Error: {}", err),
         }
     }
 }
@@ -99,7 +103,7 @@ impl error::Error for KvError {
             KvError::Utf8(ref err) => Some(err),
             KvError::Compact(ref err) => Some(err),
             KvError::Sled(ref err) => Some(err),
-            KvError::StringError(ref err) => Some(err)
+            KvError::StringError(ref err) => Some(err),
         }
     }
 }

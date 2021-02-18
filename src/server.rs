@@ -1,9 +1,15 @@
-use std::{io::{BufReader, BufWriter, Write}, net::{TcpListener, TcpStream, ToSocketAddrs}};
+use std::{
+    io::{BufReader, BufWriter, Write},
+    net::{TcpListener, TcpStream, ToSocketAddrs},
+};
 
 use serde_json::Deserializer;
 
-use crate::{KvsEngine, common::{Request, GetResponse, SetResponse, RemoveResponse}};
 use crate::error::Result;
+use crate::{
+    common::{GetResponse, RemoveResponse, Request, SetResponse},
+    KvsEngine,
+};
 
 /// Wrapper class to hold the current context of the key value server
 pub struct KvServer<E: KvsEngine> {
@@ -37,7 +43,7 @@ impl<E: KvsEngine> KvServer<E> {
         let reader = BufReader::new(&tcp);
         let mut writer = BufWriter::new(&tcp);
         let req_reader = Deserializer::from_reader(reader).into_iter::<Request>();
-    
+
         macro_rules! send_response {
             ($resp:expr) => {{
                 let response = $resp;
@@ -53,7 +59,7 @@ impl<E: KvsEngine> KvServer<E> {
             match req {
                 Request::Get { key } => send_response!(match self.engine.get(key) {
                     Ok(v) => GetResponse::Ok(v),
-                    Err(e) => GetResponse::Err(format!("{}", e))
+                    Err(e) => GetResponse::Err(format!("{}", e)),
                 }),
                 Request::Set { key, value } => send_response!(match self.engine.set(key, value) {
                     Ok(_) => SetResponse::Ok(()),
@@ -62,7 +68,7 @@ impl<E: KvsEngine> KvServer<E> {
                 Request::Remove { key } => send_response!(match self.engine.remove(key) {
                     Ok(_) => RemoveResponse::Ok(()),
                     Err(e) => RemoveResponse::Err(format!("{}", e)),
-                })
+                }),
             }
         }
 

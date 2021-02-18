@@ -273,7 +273,9 @@ fn cli_access_server(engine: &str, addr: &str) {
         .current_dir(&temp_dir)
         .assert()
         .failure()
-        .stderr(contains("String Error: KeyNotFound Err: Key could not be found inside database\n"));
+        .stderr(contains(
+            "String Error: KeyNotFound Err: Key could not be found inside database\n",
+        ));
 
     Command::cargo_bin("kvs-client")
         .unwrap()

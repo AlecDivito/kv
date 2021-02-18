@@ -10,7 +10,7 @@ pub trait KvsEngine {
     ///
     /// # Errors
     ///
-    /// Returns an error if the value is not written successfully 
+    /// Returns an error if the value is not written successfully
     fn set(&mut self, key: String, value: String) -> Result<()>;
 
     /// Gets the string value of a given string key.
@@ -18,7 +18,7 @@ pub trait KvsEngine {
     ///
     /// # Errors
     ///
-    /// Return an error if the value is not read successfullly 
+    /// Return an error if the value is not read successfullly
     fn get(&self, key: String) -> Result<Option<String>>;
 
     /// Removes a given key.
