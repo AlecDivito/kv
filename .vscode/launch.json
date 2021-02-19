@@ -26,15 +26,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'kvs'",
+            "name": "Debug executable 'server'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=kvs",
+                    "--bin=server",
                     "--package=kvs"
                 ],
                 "filter": {
-                    "name": "kvs",
+                    "name": "server",
                     "kind": "bin"
                 }
             },

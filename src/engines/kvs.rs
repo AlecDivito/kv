@@ -107,10 +107,10 @@ fn now() -> u128 {
         .as_nanos()
 }
 
-const FILE_SUFFIX: &'static str = ".kvs";
+const FILE_SUFFIX: &'static str = "kvs";
 const COMPACT_FILE: &'static str = "merge.kvs";
-const MAX_LOG_FILE_SIZE: u64 = 64 * 1024;
-const MAX_LOG_FILES: usize = 5 + 1;
+const MAX_LOG_FILE_SIZE: u64 = 5 * 64 * 1024;
+const MAX_LOG_FILES: usize = 16 + 1;
 
 impl KvStore {
     /// Build a `kvStore` from a database folder
@@ -118,7 +118,7 @@ impl KvStore {
         // 1. Load given directory, create variables
         let directory = folder.into();
         let mut logs = HashSet::new();
-        let mut map: HashMap<String, Rc<LogPointer>> = HashMap::new();
+        let mut map: HashMap<String, LogPointer> = HashMap::new();
 
         // 3. For each file or folder found in directory, loop and save `.kvs` files
         for entry in std::fs::read_dir(&directory)? {
@@ -134,16 +134,21 @@ impl KvStore {
 
         // 4. If this is the first time loading files, create the first
         if logs.len() == 0 {
-            logs.insert(Rc::new(PathBuf::from(format!("log_{}.{}", 0, FILE_SUFFIX))));
+            logs.insert(Rc::new(directory.join(format!("log_{}.{}", 0, FILE_SUFFIX))));
         }
 
         // 5. Load all references from data files into map
         for log_pointer in &logs {
             // 1. Open file, get length, create reader, u64 as [u8]
             let file = std::fs::OpenOptions::new()
+                .write(true)
                 .read(true)
+                .create(true)
                 .open(log_pointer.as_path())?;
             let file_length = file.metadata().unwrap().len();
+            if file_length == 0 {
+                break;
+            }
             let mut reader = BufReader::new(file);
             let mut command_length_buffer = [0; 8];
 
@@ -169,23 +174,25 @@ impl KvStore {
                             if command.is_remove() {
                                 old.remove();
                             } else {
-                                old.insert(Rc::new(new_pointer));
+                                old.insert(new_pointer);
                             }
                         }
                     }
                     Entry::Vacant(v) => {
-                        v.insert(Rc::new(new_pointer));
+                        v.insert(new_pointer);
                     }
                 }
             }
         }
 
         // 6. Find the file with the lowest byte size and store a FileHandler to it
-        let mut files = logs.iter().map(|p| {
-            // unwrap here is technically wrong but it should be fine
-            let length = std::fs::metadata(p.as_ref()).unwrap().len();
-            (length, p)
-        });
+        let mut files = logs.iter()
+            .map(|p| {
+                // unwrap here is technically wrong but it should be fine
+                let length = std::fs::metadata(p.as_ref()).unwrap().len();
+                (length, p)
+            });
+
         // We unwrap here because we know that there will always be at least
         // 1 element inside of the logs list
         let mut active_path = files.next().unwrap();
@@ -194,6 +201,7 @@ impl KvStore {
                 active_path = (length, pointer);
             }
         }
+
         let active_path = active_path.1.clone();
 
         // 7. Open up the active file
@@ -202,13 +210,13 @@ impl KvStore {
             .write(true)
             .append(true)
             .create(true)
-            .open(directory.join(active_path.as_ref()))?;
+            .open(active_path.as_ref())?;
 
         // 8. Get file size for active file
         let active_size = metadata(active_path.as_ref())?.len();
 
         Ok(KvStore {
-            map: HashMap::new(),
+            map,
             directory,
             active_file,
             active_path,
@@ -217,37 +225,43 @@ impl KvStore {
         })
     }
 
-    fn generate_log_file_name(&self) -> String {
-        format!("log_{}.{}", self.logs.len(), FILE_SUFFIX)
+    fn generate_log_file_name(&self, index: usize) -> String {
+        let filename= format!("log_{}.{}", index, FILE_SUFFIX);
+        if self.directory.join(&filename).exists() {
+            self.generate_log_file_name(index + 1)
+        } else {
+            filename
+        }
     }
 
     // Rotate closes the active file and creates a new one
     fn rotate(&mut self) -> Result<()> {
-        self.active_size = 0;
-        self.active_path = Rc::new(self.directory.join(self.generate_log_file_name()));
-
         // get all old logs before creating a new active file
         let old_logs = std::fs::read_dir(&self.directory)?
             .map(|e| e.unwrap())
             .filter(|f| f.file_name().to_string_lossy().ends_with(FILE_SUFFIX))
             .collect::<Vec<DirEntry>>();
-
+            
         // create active file
+        self.active_size = 0;
+        self.active_path = Rc::new(self.directory.join(self.generate_log_file_name(self.logs.len())));
         self.logs.insert(self.active_path.clone());
         self.active_file = std::fs::OpenOptions::new()
             .write(true)
+            .read(true)
             .create(true)
             .open(self.active_path.as_ref())?;
 
-        // merge all old files togther if there are too many
+        // merge all old files togther if there are too many, delete the old ones
         if old_logs.len() > MAX_LOG_FILES {
             self.merge()?;
+
+            // delete all old logs
+            old_logs
+                .iter()
+                .for_each(|f| std::fs::remove_file(f.path()).unwrap());
         }
 
-        // delete all old logs
-        old_logs
-            .iter()
-            .for_each(|f| std::fs::remove_file(f.path()).unwrap());
 
         Ok(())
     }
@@ -255,7 +269,7 @@ impl KvStore {
     // Go through `ALL` records and merge them all into one file
     fn merge(&mut self) -> Result<()> {
         // Create compact file
-        let merge_path = Rc::new(self.directory.join(self.generate_log_file_name()));
+        let merge_path = Rc::new(self.directory.join(self.generate_log_file_name(self.logs.len())));
         let compact_path = self.directory.join(COMPACT_FILE);
         let mut merge_file = std::fs::OpenOptions::new()
             .write(true)
@@ -321,8 +335,8 @@ impl KvsEngine for KvStore {
         let command_buffer_length_buffer = u64::to_be_bytes(command_buffer.len() as u64);
 
         // Append serialized command to log file
-        let offset = self.active_size + command_buffer.len() as u64;
-        self.active_size = offset + command_buffer_length_buffer.len() as u64;
+        let offset = self.active_size + command_buffer_length_buffer.len() as u64;
+        self.active_size = offset + command_buffer.len() as u64;
         self.active_file.write(&command_buffer_length_buffer)?;
         self.active_file.write(&command_buffer)?;
         self.active_file.flush()?;
