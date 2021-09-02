@@ -1,0 +1,7 @@
+/target
+index.database
+debug.txt
+.temp/
+engine
+results/
+.corrupt_git
