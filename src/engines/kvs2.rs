@@ -3,13 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     convert::TryInto,
-    ffi::OsStr,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    ops::Index,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex, RwLock, RwLockReadGuard},
+    sync::{Arc, Mutex, RwLock},
 };
 use uuid::Uuid;
 
@@ -27,11 +25,7 @@ impl Hint {
     pub fn new(record: &Record, value_position: usize) -> Self {
         Self {
             timestamp: record.timestamp,
-            value_size: record
-                .value
-                .clone()
-                .unwrap_or(String::with_capacity(0))
-                .len(),
+            value_size: record.value().len(),
             value_position,
             key: record.key.clone(),
         }
@@ -44,9 +38,6 @@ struct Record {
     timestamp: u128,
     key: String,
     value: Option<String>,
-
-    #[serde(skip)]
-    trailing: Vec<u8>,
 }
 
 impl Record {
@@ -57,7 +48,6 @@ impl Record {
             timestamp,
             key,
             value,
-            trailing: Vec::with_capacity(0),
         };
         record.crc = record.calculate_crc();
         record
@@ -75,6 +65,10 @@ impl Record {
                 .as_bytes(),
         );
         digest.finalize()
+    }
+
+    pub fn value(&self) -> String {
+        self.value.clone().unwrap_or("".to_string())
     }
 }
 
@@ -120,6 +114,14 @@ impl Key {
             timestamp: hint.timestamp,
         }
     }
+
+    pub fn to_record(&self, key: String) -> crate::Result<Record> {
+        let mut reader = BufReader::new(File::open(self.file_id.read().unwrap().as_path())?);
+        let mut value = vec![0u8; self.value_size];
+        reader.seek_relative(self.value_position.try_into().unwrap())?;
+        reader.read(&mut value)?;
+        Ok(Record::new(key, Some(String::from_utf8(value).unwrap())))
+    }
 }
 
 impl std::fmt::Display for Key {
@@ -153,6 +155,35 @@ impl KeyDir {
             active_path: Arc::new(RwLock::new(active_path)),
             active_file,
         })
+    }
+
+    fn read_in_hint_file(
+        &self,
+        hint_path: Arc<Mutex<Option<PathBuf>>>,
+    ) -> crate::Result<Arc<RwLock<PathBuf>>> {
+        let hint_file_path = hint_path.lock().unwrap().as_ref().unwrap().clone();
+        let mut data_file_path = hint_file_path.clone();
+        data_file_path.set_extension("log");
+        let data_file_path = Arc::new(RwLock::new(data_file_path));
+
+        let mut reader = BufReader::new(File::open(&*hint_file_path)?);
+        while reader.fill_buf().unwrap().len() != 0 {
+            let hint = bincode::deserialize_from(&mut reader)?;
+            let key = Key::from_hint(data_file_path.clone(), &hint);
+            self.insert(hint.key, key);
+        }
+        Ok(data_file_path)
+    }
+
+    fn read_in_record_file(&self, record_path: Arc<RwLock<PathBuf>>) -> crate::Result<()> {
+        let mut reader = BufReader::new(File::open(record_path.read().unwrap().as_path())?);
+        while reader.fill_buf().unwrap().len() != 0 {
+            let record: Record = bincode::deserialize_from(&mut reader).unwrap();
+            trace!("Adding record ({})", &record);
+            let record_head = reader.seek(SeekFrom::Current(0)).unwrap() as usize;
+            self.append(record_head, record_path.clone(), record);
+        }
+        Ok(())
     }
 
     /// `find` the value if it exists inside of the keyed directory
@@ -225,33 +256,21 @@ impl KeyDir {
             .insert(key, Arc::new(RwLock::new(value)));
     }
 
-    /// `merge` takes all of the data that is currently saved inside of the key
+    /// `save_key_dir` takes all of the data that is currently saved inside of the key
     /// value store and saves all of the values in one active file. It is assumed
     /// you call this from a seprate thread that contains a copy of all of the
     /// data.
-    pub fn merge(&self, hint_path: Arc<RwLock<PathBuf>>) -> crate::Result<()> {
-        let helper_path = &*hint_path.read().unwrap();
-        let mut helper_writer = BufWriter::new(File::create(helper_path).unwrap());
-        let mut writer = self.active_file.lock().unwrap();
-        let map = self.inner.read().unwrap();
-        for (key, pointer) in &*map {
-            // read value
-            let pointer_lock = pointer.read().unwrap();
-            let mut reader =
-                BufReader::new(File::open(pointer_lock.file_id.read().unwrap().as_path())?);
-            let mut value = String::with_capacity(pointer_lock.value_size);
-            reader.seek_relative(pointer_lock.value_position.try_into().unwrap())?;
-            reader.read(unsafe { value.as_bytes_mut() })?;
-            // write to active file
-            let record = Record::new(key.clone(), Some(value.clone()));
-            let bytes = bincode::serialize(&record)?;
-            writer.write(&bytes)?;
-            let value_position = writer.seek(SeekFrom::Current(0)).unwrap() as usize - value.len();
+    pub fn save_key_dir(&self, hint_path: impl Into<PathBuf>) -> crate::Result<()> {
+        let mut hint_writer = BufWriter::new(File::create(hint_path.into())?);
+        let mut data_writer = self.active_file.lock().unwrap();
+        for (key, value) in &*self.inner.read().unwrap() {
+            let record = value.read().unwrap().to_record(key.clone())?;
+            // write data
+            data_writer.write(&bincode::serialize(&record)?)?;
+            let data_writer_head = data_writer.seek(SeekFrom::Current(0)).unwrap() as usize;
+            let value_position = data_writer_head - record.value().len();
             let hint = Hint::new(&record, value_position);
-            // no self write here because we are just handling the happy path
-            // write to hint
-            let hint_bytes = bincode::serialize(&hint)?;
-            helper_writer.write(&hint_bytes)?;
+            hint_writer.write(&bincode::serialize(&hint)?)?;
         }
 
         Ok(())
@@ -303,18 +322,9 @@ impl ImmutableFiles {
             if entry.path().is_dir() {
                 continue;
             }
-            let stem = entry
-                .path()
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .to_string();
-            let hint_id = format!("{}.hint", stem);
-            let hint_path: PathBuf = directory.clone().join(hint_id);
-            if hint.is_none() && hint_path.exists() && hint_path.is_file() {
-                debug!("Found hint file: {:?}", hint_path.as_path());
-                hint = Some(hint_path);
+            if hint.is_none() && entry.path().extension().unwrap() == "hint" {
+                debug!("Found hint file: {:?}", entry.path());
+                hint = Some(entry.path());
             } else {
                 debug!("Added file to immutable files: {:?}", entry.path());
                 inner.push(Arc::new(RwLock::new(entry.path())));
@@ -326,48 +336,24 @@ impl ImmutableFiles {
         })
     }
 
-    pub fn build_state(&self, active_path: Arc<RwLock<PathBuf>>) -> crate::Result<KeyDir> {
-        let key_directory = KeyDir::new(active_path.read().unwrap().as_path())?;
+    pub fn build_state(&self, path: impl Into<PathBuf>) -> crate::Result<KeyDir> {
+        let key_directory = KeyDir::new(path)?;
         let paths = &*self.inner.read().unwrap();
         let hint = self.hint.lock().unwrap();
-        let paths_lock = match &*hint {
+
+        let record_paths = match &*hint {
             Some(hint) => {
-                // check if a hint file exists
-                let hint_stem = hint.file_stem().unwrap().to_str().unwrap().to_string();
-                let hint_data_path = paths
-                    .iter()
-                    .find(|p| {
-                        p.read()
-                            .unwrap()
-                            .file_stem()
-                            .unwrap()
-                            .to_str()
-                            .unwrap()
-                            .to_string()
-                            == hint_stem
-                    })
-                    .unwrap();
+                // find the hints log file
+                let hint_path = Arc::new(Mutex::new(Some(hint.clone())));
+                key_directory.read_in_hint_file(hint_path)?;
 
-                let mut reader = BufReader::new(File::open(&*hint_data_path.read().unwrap())?);
-                while reader.fill_buf().unwrap().len() != 0 {
-                    let hint = bincode::deserialize_from(&mut reader)?;
-                    let key = Key::from_hint(hint_data_path.clone(), &hint);
-                    key_directory.insert(hint.key, key);
-                }
-
+                // build data_file_path
+                let mut data_file_path = hint.clone();
+                data_file_path.set_extension("log");
                 // return all of the immutable files without the hint
                 paths
                     .iter()
-                    .filter(|p| {
-                        p.read()
-                            .unwrap()
-                            .file_stem()
-                            .unwrap()
-                            .to_str()
-                            .unwrap()
-                            .to_string()
-                            != hint_stem
-                    })
+                    .filter(|p| **p.read().unwrap() != data_file_path)
                     .map(|a| a.clone())
                     .collect::<Vec<Arc<RwLock<PathBuf>>>>()
             }
@@ -375,40 +361,25 @@ impl ImmutableFiles {
         };
 
         // loop over rest of files
-        for path in &*paths_lock {
-            let lock = path.read().unwrap();
-
-            // skip if this is the hint_path
-            let mut reader = BufReader::new(File::open(lock.as_path())?);
-            while reader.fill_buf().unwrap().len() != 0 {
-                let record: Record = match bincode::deserialize_from(&mut reader) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        error!("Decoding error: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                trace!("Adding record ({})", &record);
-                let record_head = reader.seek(SeekFrom::Current(0)).unwrap() as usize;
-                key_directory.append(record_head, path.clone(), record);
-            }
+        for record_path in &*record_paths {
+            key_directory.read_in_record_file(record_path.clone())?;
         }
         Ok(key_directory)
     }
 
-    pub fn overwrite_pointers(&mut self, new_source: impl Into<PathBuf>) {
-        let source: PathBuf = new_source.into();
-        let paths_lock = self.inner.read().unwrap();
-        for path in &*paths_lock {
-            let mut lock = path.write().unwrap();
-            *lock = source.clone();
-        }
+    pub fn overwrite_pointers(&mut self, data_path_pointer: Arc<RwLock<PathBuf>>) {
+        *self.inner.write().unwrap() = vec![data_path_pointer];
     }
 
-    pub fn overwrite_hint_pointer(&mut self, hint_path: impl Into<PathBuf>) {
+    pub fn overwrite_hint_pointer(
+        &mut self,
+        hint_path: impl Into<PathBuf>,
+    ) -> Arc<Mutex<Option<PathBuf>>> {
         let hint_path = hint_path.into();
         let mut lock = self.hint.lock().unwrap();
         *lock = Some(hint_path);
+        drop(lock);
+        self.hint.clone()
     }
 
     pub fn as_paths(&self) -> Vec<PathBuf> {
@@ -417,7 +388,6 @@ impl ImmutableFiles {
             .unwrap()
             .iter()
             .map(|rc| rc.read().unwrap().to_path_buf())
-            .filter(|rc| rc.extension().unwrap_or(OsStr::new("")) == "log")
             .collect()
     }
 
@@ -445,54 +415,64 @@ pub struct KvStore {
 
 impl KvStore {
     fn write(&self, record: Record) -> crate::Result<()> {
-        self.key_directory.read().unwrap().write(record)?;
+        let keydir = self.key_directory.read().unwrap();
+        keydir.write(record)?;
 
         // when we have finished writing, we need to check if we've hit our file
         // limit. If we have, we need to retire the current active file and open
         // a new one.
         // if self.key_directory.read().unwrap().active_file_length() > 55000000 {
-        if self.key_directory.read().unwrap().active_file_length() > 1000 {
+        if keydir.active_file_length() > 1000 {
+            self.immutable_files.push(keydir.active_path.clone());
             debug!("Active file is too large, writing it to disk");
-            // 1. Append current active file to our stack
-            self.immutable_files
-                .push(self.key_directory.read().unwrap().active_path.clone());
-            // 2. Create a new active file
-            let active_file_path = self
-                .directory
-                .clone()
-                .join(format!("{}.log", Uuid::new_v4()));
+
+            let new_file_name = format!("{}.log", Uuid::new_v4());
+            let active_file_path = self.directory.clone().join(new_file_name);
             *self.active_path.write().unwrap() = active_file_path.clone();
-            self.key_directory
-                .write()
-                .unwrap()
-                .set_active_file(active_file_path)?;
+            debug!("Created new active log: {:?}", active_file_path);
+
+            drop(keydir);
+            let mut keydir = self.key_directory.write().unwrap();
+            keydir.set_active_file(active_file_path)?;
+
             // 3. Compact
             if self.immutable_files.len() > 3 {
                 debug!("Too many files found. Compacting them together.");
                 let mut immutable_files = self.immutable_files.clone();
-                let name = Uuid::new_v4();
-                let merge_path = self.directory.clone().join(format!("{}.log", name));
-                let hint_path = self.directory.clone().join(format!("{}.hint", name));
-                let merge_file = Arc::new(RwLock::new(merge_path.clone()));
-                let hint_file = Arc::new(RwLock::new(hint_path.clone()));
+                let key_directory = self.key_directory.clone();
+                let directory = self.directory.clone();
+
                 std::thread::spawn(move || {
                     // old paths
-                    let old_immutable_file_paths = immutable_files.as_paths();
-                    let old_immutable_hint_path = immutable_files.hint_path();
+                    let old_immutable_data_file_paths = immutable_files.as_paths();
+                    let old_immutable_hint_file_path = immutable_files.hint_path();
+
+                    // create merge file
+                    let name = Uuid::new_v4();
+                    let merge_path = directory.clone().join(format!("{}.log", name));
+                    let hint_path = directory.clone().join(format!("{}.hint", name));
 
                     // build merge and hint files
-                    let keydir = immutable_files.build_state(merge_file.clone()).unwrap();
-                    keydir.merge(hint_file.clone()).unwrap();
+                    let keydir = immutable_files.build_state(&merge_path).unwrap();
+                    keydir.save_key_dir(&hint_path).unwrap();
+
+                    // update key directory with hint file
+                    let hint_path_pointer = immutable_files.overwrite_hint_pointer(hint_path);
+                    let data_path_pointer = key_directory
+                        .write()
+                        .unwrap()
+                        .read_in_hint_file(hint_path_pointer.clone())
+                        .unwrap();
 
                     // overwrite immutable_files to point to the merged file
-                    immutable_files.overwrite_pointers(merge_path);
-                    immutable_files.overwrite_hint_pointer(hint_path);
+                    immutable_files.overwrite_pointers(data_path_pointer);
+
                     // delete all old immutable_files
-                    if let Some(old_hint_path) = old_immutable_hint_path {
+                    if let Some(old_hint_path) = old_immutable_hint_file_path {
                         debug!("Removed old hint file: {:?}", old_hint_path);
                         std::fs::remove_file(old_hint_path).unwrap();
                     }
-                    for path in old_immutable_file_paths {
+                    for path in old_immutable_data_file_paths {
                         if path.exists() {
                             debug!("Removed old immutable file: {:?}", path);
                             std::fs::remove_file(path).unwrap();
@@ -526,21 +506,17 @@ impl KvsEngine for KvStore {
         }
 
         let immutable_files = ImmutableFiles::new(directory.as_path())?;
-        let active_file_name = PathBuf::from(format!("{}.log", Uuid::new_v4()));
-        let active_path = Arc::new(RwLock::new(
-            directory.clone().join(active_file_name.as_path()),
-        ));
-        let key_directory = immutable_files.build_state(Arc::new(RwLock::new(
-            directory.clone().join(active_file_name.as_path()),
-        )))?;
-        info!("State read, application ready for requests");
+        let log_file_path = directory.clone().join(format!("{}.log", Uuid::new_v4()));
+        let key_directory = immutable_files.build_state(&log_file_path)?;
 
-        Ok(Self {
-            directory: Pin::new(Box::new(directory)),
+        let store = Self {
             immutable_files,
-            active_path,
+            directory: Pin::new(Box::new(directory)),
+            active_path: Arc::new(RwLock::new(log_file_path.clone())),
             key_directory: Arc::new(RwLock::new(key_directory)),
-        })
+        };
+        info!("State read, application ready for requests");
+        Ok(store)
     }
 
     fn set(&self, key: String, value: String) -> crate::Result<()> {
