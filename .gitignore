@@ -5,3 +5,4 @@ debug.txt
 engine
 results/
 .corrupt_git
+.sled

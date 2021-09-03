@@ -39,9 +39,9 @@ KvStore::open(path: impl Into<PathBuf>) -> Result<KvStore>
 
 | Done  | Description                                                                                                                                          |
 | :---: | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-|  []   | maintain a log on disk (write-ahead log) of previous write commands. Evaluate that file on startup to re-create the state of the database in memory. |
-|  []   | Extend the functionality by storing only the keys in memory, along with offsets into the on-disk log.                                                |
-|  []   | Introduce log compaction so the log can't grow indefinitely                                                                                          |
+|  [x]  | maintain a log on disk (write-ahead log) of previous write commands. Evaluate that file on startup to re-create the state of the database in memory. |
+|  [x]  | Extend the functionality by storing only the keys in memory, along with offsets into the on-disk log.                                                |
+|  [x]  | Introduce log compaction so the log can't grow indefinitely                                                                                          |
 
 ## Terminology
 

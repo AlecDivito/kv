@@ -10,7 +10,10 @@ fn set_bench(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let temp_dir = TempDir::new().unwrap();
-                (KvStore::open(".temp" /* temp_dir.path() */).unwrap(), temp_dir)
+                (
+                    KvStore::open(".temp" /* temp_dir.path() */).unwrap(),
+                    temp_dir,
+                )
             },
             |(mut store, _temp_dir)| {
                 for i in 1..(1 << 12) {
@@ -24,7 +27,7 @@ fn set_bench(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let temp_dir = TempDir::new().unwrap();
-                (SledKvsEngine::new(sled::open(&temp_dir).unwrap()), temp_dir)
+                (SledKvsEngine::open(".sled").unwrap(), temp_dir)
             },
             |(mut db, _temp_dir)| {
                 for i in 1..(1 << 12) {
@@ -39,10 +42,9 @@ fn set_bench(c: &mut Criterion) {
 
 fn get_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_bench");
-    for i in &vec![6, 8, 10, 12/*, 16, 20*/] {
+    for i in &vec![6, 8, 10, 12 /*, 16, 20*/] {
         group.bench_with_input(format!("kvs_{}", i), i, |b, i| {
-            let temp_dir = TempDir::new().unwrap();
-            let mut store = KvStore::open(temp_dir.path()).unwrap();
+            let store = KvStore::open("./temp").unwrap();
             for key_i in 1..(1 << i) {
                 store
                     .set(format!("key{}", key_i), "value".to_string())
@@ -56,10 +58,9 @@ fn get_bench(c: &mut Criterion) {
             })
         });
     }
-    for i in &vec![6, 8, 10, 12/*, 16, 20*/] {
+    for i in &vec![6, 8, 10, 12 /*, 16, 20*/] {
         group.bench_with_input(format!("sled_{}", i), i, |b, i| {
-            let temp_dir = TempDir::new().unwrap();
-            let mut db = SledKvsEngine::new(sled::open(&temp_dir).unwrap());
+            let db = SledKvsEngine::open(".sled").unwrap();
             for key_i in 1..(1 << i) {
                 db.set(format!("key{}", key_i), "value".to_string())
                     .unwrap();

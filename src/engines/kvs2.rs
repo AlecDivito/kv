@@ -205,7 +205,6 @@ impl KeyDir {
         let mut writer = self.active_file.lock().unwrap();
         let bytes = bincode::serialize(&record)?;
         writer.write(&bytes)?;
-        writer.flush()?;
         let record_head = writer.seek(SeekFrom::Current(0)).unwrap() as usize;
         let value_position = record_head - record.value.as_ref().unwrap_or(&"".to_string()).len();
         trace!("Wrote record ({}) to buffer", &record);
@@ -422,7 +421,7 @@ impl KvStore {
         // limit. If we have, we need to retire the current active file and open
         // a new one.
         // if self.key_directory.read().unwrap().active_file_length() > 55000000 {
-        if keydir.active_file_length() > 1000 {
+        if keydir.active_file_length() > 55000000 {
             self.immutable_files.push(keydir.active_path.clone());
             debug!("Active file is too large, writing it to disk");
 
@@ -436,7 +435,7 @@ impl KvStore {
             keydir.set_active_file(active_file_path)?;
 
             // 3. Compact
-            if self.immutable_files.len() > 3 {
+            if self.immutable_files.len() > 10 {
                 debug!("Too many files found. Compacting them together.");
                 let mut immutable_files = self.immutable_files.clone();
                 let key_directory = self.key_directory.clone();
