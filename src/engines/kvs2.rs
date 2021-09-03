@@ -86,14 +86,18 @@ impl std::fmt::Display for Record {
 }
 
 struct Key {
-    file_id: Arc<RwLock<PathBuf>>,
+    file_id: Arc<RwLock<ImmutableCache>>,
     value_size: usize,
     value_position: usize,
     timestamp: u128,
 }
 
 impl Key {
-    pub fn from_record(path: Arc<RwLock<PathBuf>>, record: &Record, value_position: usize) -> Self {
+    pub fn from_record(
+        path: Arc<RwLock<ImmutableCache>>,
+        record: &Record,
+        value_position: usize,
+    ) -> Self {
         Self {
             file_id: path,
             value_size: record
@@ -106,7 +110,7 @@ impl Key {
         }
     }
 
-    pub fn from_hint(path: Arc<RwLock<PathBuf>>, hint: &Hint) -> Self {
+    pub fn from_hint(path: Arc<RwLock<ImmutableCache>>, hint: &Hint) -> Self {
         Self {
             file_id: path,
             value_size: hint.value_size,
@@ -116,10 +120,12 @@ impl Key {
     }
 
     pub fn to_record(&self, key: String) -> crate::Result<Record> {
-        let mut reader = BufReader::new(File::open(self.file_id.read().unwrap().as_path())?);
+        let mut cache = self.file_id.write().unwrap();
         let mut value = vec![0u8; self.value_size];
-        reader.seek_relative(self.value_position.try_into().unwrap())?;
-        reader.read(&mut value)?;
+        cache
+            .reader
+            .seek(SeekFrom::Start(self.value_position as u64))?;
+        cache.reader.read(&mut value)?;
         Ok(Record::new(key, Some(String::from_utf8(value).unwrap())))
     }
 }
@@ -129,7 +135,7 @@ impl std::fmt::Display for Key {
         write!(
             f,
             "Key({:?}, {}): {} -> {}",
-            &*self.file_id.read().unwrap(),
+            &*self.file_id.read().unwrap().path,
             self.timestamp,
             self.value_position,
             self.value_position + self.value_size
@@ -140,7 +146,7 @@ impl std::fmt::Display for Key {
 pub struct KeyDir {
     inner: Arc<RwLock<BTreeMap<String, Arc<RwLock<Key>>>>>,
     active_file: Arc<Mutex<BufWriter<File>>>,
-    active_path: Arc<RwLock<PathBuf>>,
+    active_path: Arc<RwLock<ImmutableCache>>,
 }
 
 impl KeyDir {
@@ -152,7 +158,10 @@ impl KeyDir {
         )?)));
         Ok(Self {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
-            active_path: Arc::new(RwLock::new(active_path)),
+            active_path: Arc::new(RwLock::new(ImmutableCache {
+                reader: BufReader::new(File::open(&active_path)?),
+                path: active_path,
+            })),
             active_file,
         })
     }
@@ -160,11 +169,14 @@ impl KeyDir {
     fn read_in_hint_file(
         &self,
         hint_path: Arc<Mutex<Option<PathBuf>>>,
-    ) -> crate::Result<Arc<RwLock<PathBuf>>> {
+    ) -> crate::Result<Arc<RwLock<ImmutableCache>>> {
         let hint_file_path = hint_path.lock().unwrap().as_ref().unwrap().clone();
         let mut data_file_path = hint_file_path.clone();
         data_file_path.set_extension("log");
-        let data_file_path = Arc::new(RwLock::new(data_file_path));
+        let data_file_path = Arc::new(RwLock::new(ImmutableCache {
+            reader: BufReader::new(File::open(&data_file_path)?),
+            path: data_file_path,
+        }));
 
         let mut reader = BufReader::new(File::open(&*hint_file_path)?);
         while reader.fill_buf().unwrap().len() != 0 {
@@ -175,12 +187,12 @@ impl KeyDir {
         Ok(data_file_path)
     }
 
-    fn read_in_record_file(&self, record_path: Arc<RwLock<PathBuf>>) -> crate::Result<()> {
-        let mut reader = BufReader::new(File::open(record_path.read().unwrap().as_path())?);
-        while reader.fill_buf().unwrap().len() != 0 {
-            let record: Record = bincode::deserialize_from(&mut reader).unwrap();
+    fn read_in_record_file(&self, record_path: Arc<RwLock<ImmutableCache>>) -> crate::Result<()> {
+        let mut cache = record_path.write().unwrap();
+        while cache.reader.fill_buf().unwrap().len() != 0 {
+            let record: Record = bincode::deserialize_from(&mut cache.reader).unwrap();
             trace!("Adding record ({})", &record);
-            let record_head = reader.seek(SeekFrom::Current(0)).unwrap() as usize;
+            let record_head = cache.reader.seek(SeekFrom::Current(0)).unwrap() as usize;
             self.append(record_head, record_path.clone(), record);
         }
         Ok(())
@@ -225,7 +237,7 @@ impl KeyDir {
     /// currently building the datastructure for whatever reason. It does not
     /// commit it's knowledge to a file and only saves the values to the internal
     /// hashmap.
-    fn append(&self, record_head: usize, file_path: Arc<RwLock<PathBuf>>, record: Record) {
+    fn append(&self, record_head: usize, file_path: Arc<RwLock<ImmutableCache>>, record: Record) {
         if record.calculate_crc() != record.crc {
             error!(
                 "Corruption found inside of record while merging: {:?}",
@@ -284,7 +296,10 @@ impl KeyDir {
                 .create(true)
                 .open(&path.as_path())?,
         );
-        self.active_path = Arc::new(RwLock::new(path));
+        self.active_path = Arc::new(RwLock::new(ImmutableCache {
+            reader: BufReader::new(File::open(&path)?),
+            path,
+        }));
         *self.active_file.lock().unwrap() = new_active_file;
         Ok(())
     }
@@ -304,9 +319,14 @@ impl KeyDir {
     }
 }
 
+struct ImmutableCache {
+    reader: BufReader<File>,
+    path: PathBuf,
+}
+
 #[derive(Clone)]
 struct ImmutableFiles {
-    inner: Arc<RwLock<Vec<Arc<RwLock<PathBuf>>>>>,
+    inner: Arc<RwLock<Vec<Arc<RwLock<ImmutableCache>>>>>,
     hint: Arc<Mutex<Option<PathBuf>>>,
 }
 
@@ -326,7 +346,10 @@ impl ImmutableFiles {
                 hint = Some(entry.path());
             } else {
                 debug!("Added file to immutable files: {:?}", entry.path());
-                inner.push(Arc::new(RwLock::new(entry.path())));
+                inner.push(Arc::new(RwLock::new(ImmutableCache {
+                    reader: BufReader::new(File::open(entry.path())?),
+                    path: entry.path(),
+                })));
             }
         }
         Ok(Self {
@@ -352,9 +375,9 @@ impl ImmutableFiles {
                 // return all of the immutable files without the hint
                 paths
                     .iter()
-                    .filter(|p| **p.read().unwrap() != data_file_path)
+                    .filter(|p| p.read().unwrap().path != data_file_path)
                     .map(|a| a.clone())
-                    .collect::<Vec<Arc<RwLock<PathBuf>>>>()
+                    .collect::<Vec<Arc<RwLock<ImmutableCache>>>>()
             }
             None => paths.clone(),
         };
@@ -366,7 +389,7 @@ impl ImmutableFiles {
         Ok(key_directory)
     }
 
-    pub fn overwrite_pointers(&mut self, data_path_pointer: Arc<RwLock<PathBuf>>) {
+    pub fn overwrite_pointers(&mut self, data_path_pointer: Arc<RwLock<ImmutableCache>>) {
         *self.inner.write().unwrap() = vec![data_path_pointer];
     }
 
@@ -386,7 +409,7 @@ impl ImmutableFiles {
             .read()
             .unwrap()
             .iter()
-            .map(|rc| rc.read().unwrap().to_path_buf())
+            .map(|rc| rc.read().unwrap().path.clone())
             .collect()
     }
 
@@ -394,7 +417,7 @@ impl ImmutableFiles {
         (&*self.hint.lock().unwrap()).to_owned()
     }
 
-    pub fn push(&self, path: Arc<RwLock<PathBuf>>) {
+    pub fn push(&self, path: Arc<RwLock<ImmutableCache>>) {
         self.inner.write().unwrap().push(path);
     }
 
@@ -469,7 +492,9 @@ impl KvStore {
                     // delete all old immutable_files
                     if let Some(old_hint_path) = old_immutable_hint_file_path {
                         debug!("Removed old hint file: {:?}", old_hint_path);
-                        std::fs::remove_file(old_hint_path).unwrap();
+                        if old_hint_path.exists() {
+                            std::fs::remove_file(old_hint_path).unwrap();
+                        }
                     }
                     for path in old_immutable_data_file_paths {
                         if path.exists() {
@@ -529,23 +554,24 @@ impl KvsEngine for KvStore {
         // Check if we are reading from the active file. If we are, we need to
         // flush the writer so that we know for sure that all changes have been
         // committed to disk.
-        let file_id = &*keydir_lock.file_id.read().unwrap();
-        let active_path = &*self.active_path.read().unwrap();
-        if file_id == active_path {
-            debug!("Reading from active file. Flushing write buffer");
-            self.key_directory.read().unwrap().flush()?;
-        }
-        let mut reader = BufReader::new(File::open(file_id.as_path())?);
+        // let file_id = &*keydir_lock.file_id.read().unwrap();
+        // let active_path = &*self.active_path.read().unwrap();
+        // if file_id == active_path {
+        //     debug!("Reading from active file. Flushing write buffer");
+        //     self.key_directory.read().unwrap().flush()?;
+        // }
+        // let mut reader = BufReader::new(File::open(file_id.as_path())?);
         let mut value = vec![0u8; keydir_lock.value_size];
-        let seek_position: i64 = keydir_lock.value_position.try_into().unwrap();
-        debug!(
-            "Reading from string ({} to {}) in file: {:?}",
-            seek_position,
-            seek_position + keydir_lock.value_size as i64,
-            file_id.as_path()
-        );
-        reader.seek_relative(seek_position)?;
-        reader.read(&mut value)?;
+        let seek_position: u64 = keydir_lock.value_position.try_into().unwrap();
+        // debug!(
+        //     "Reading from string ({} to {}) in file: {:?}",
+        //     seek_position,
+        //     seek_position + keydir_lock.value_size as i64,
+        //     file_id.as_path()
+        // );
+        let mut cache = keydir_lock.file_id.write().unwrap();
+        cache.reader.seek(SeekFrom::Start(seek_position))?;
+        cache.reader.read(&mut value)?;
         Ok(Some(String::from_utf8(value).unwrap()))
     }
 

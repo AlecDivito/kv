@@ -1,8 +1,5 @@
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
-use std::sync::PoisonError;
-use std::sync::RwLockReadGuard;
 use std::{error, string::FromUtf8Error};
 
 /// Generic Error because right now i'm to lazy to implement an actually good
