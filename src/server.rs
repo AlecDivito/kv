@@ -43,7 +43,6 @@ impl<E: KvsEngine> KvServer<E> {
         let reader = BufReader::new(&tcp);
         let mut writer = BufWriter::new(&tcp);
         let req_reader = Deserializer::from_reader(reader).into_iter::<Request>();
-
         macro_rules! send_response {
             ($resp:expr) => {{
                 let response = $resp;

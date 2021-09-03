@@ -7,7 +7,7 @@ extern crate log;
 
 pub use client::KvClient;
 pub use engines::{KvStore, KvsEngine, SledKvsEngine};
-pub use error::{ KvError, GenericError, Result};
+pub use error::{GenericError, KvError, Result};
 pub use server::KvServer;
 
 mod client;
