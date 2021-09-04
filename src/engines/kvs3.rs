@@ -1,101 +1,254 @@
-use crc::{Crc, CRC_32_ISCSI};
-use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     convert::TryInto,
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, RwLock},
 };
+
 use uuid::Uuid;
 
-use crate::{common::now, KvError, KvsEngine};
+use crate::{engines::sstable::Hint, KvError, KvsEngine};
 
-use super::sstable::SSTable;
+use super::sstable::{Record, SSTable, Segment, SegmentReader};
 
-struct Segment {}
+enum Storage {
+    SSTable(SSTable),
+    Segment(Segment),
+}
+
+impl Storage {
+    pub fn segment(&self) -> Option<&Segment> {
+        match self {
+            Storage::SSTable(_) => None,
+            Storage::Segment(s) => Some(s),
+        }
+    }
+
+    pub fn sstable(&self) -> Option<&SSTable> {
+        match self {
+            Storage::SSTable(s) => Some(s),
+            Storage::Segment(_) => None,
+        }
+    }
+}
+
+struct Level {
+    level: Pin<Box<usize>>,
+    directory: Pin<Box<PathBuf>>,
+    segments: Pin<Box<[Option<Storage>; 5]>>,
+    index: Pin<Box<usize>>,
+}
+
+impl Level {
+    pub fn new(directory: impl Into<PathBuf>, level: usize) -> crate::Result<Self> {
+        let directory = directory.into();
+        let reader = BufReader::new(File::open((&directory).join("order"))?);
+        let segments = [None; 5];
+        let mut line = String::new();
+        let mut index = 0;
+        loop {
+            let size = reader.read_line(&mut line)?;
+            if size == 0 {
+                break;
+            }
+            if index >= 5 {
+                // TODO: instead of failing here, we may want to just compact our
+                // files...
+                return Err(KvError::Parse("To many level files found".into()));
+            }
+            segments[index] = Some(Storage::Segment(Segment::from_log(
+                (&directory).join(line),
+            )?));
+        }
+        Ok(Self {
+            level: Pin::new(Box::new(level)),
+            directory: Pin::new(Box::new(directory)),
+            segments: Pin::new(Box::new(segments)),
+            index: Pin::new(Box::new(index)),
+        })
+    }
+
+    pub fn insert(
+        &mut self,
+        storage: Storage,
+        next_path: impl Into<PathBuf>,
+    ) -> crate::Result<Option<Segment>> {
+        let segment = match storage {
+            Storage::SSTable(s) => {
+                s.rotate((&self.directory).join(format!("{}.log", Uuid::new_v4())))?
+            }
+            Storage::Segment(s) => s,
+        };
+        let segments = *self.segments;
+        segments[*self.index] = Some(Storage::Segment(segment));
+
+        // Check to see if we need to rotate the files
+        let avalible_segments = self
+            .segments
+            .iter()
+            .fold(5, |count, el| count - if el.is_some() { 1 } else { 0 });
+
+        // do the merge if we are at full capacity
+        Ok(if avalible_segments == 5 {
+            let merge = self.merge(next_path)?;
+            for s in self.segments.iter_mut() {
+                *s = None
+            }
+            Some(merge)
+        } else {
+            None
+        })
+    }
+
+    pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
+        for level in self.segments.iter() {
+            if let Some(segment) = level.as_ref() {
+                if let Some(value) = match segment {
+                    Storage::SSTable(s) => s.get(key),
+                    Storage::Segment(s) => s.get(key)?,
+                } {
+                    return Ok(Some(value));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn merge(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
+        let mut readers = self
+            .segments
+            .iter()
+            .filter_map(|o| o.as_ref().unwrap().segment())
+            .filter_map(|segment| SegmentReader::new(segment).ok())
+            .collect::<Vec<SegmentReader>>();
+
+        let mut index = HashMap::new();
+        let mut size = 0;
+        let segment_path = path.into();
+        let writer = BufWriter::new(File::create(&segment_path)?);
+        loop {
+            for reader in &readers {
+                reader.next()?;
+            }
+
+            // 1. Find the keys with the lowest
+            // remember that files do not have dulicates
+            let mut records = readers
+                .iter_mut()
+                .map(|f| f.peek())
+                .filter(|f| f.is_none())
+                .collect::<Vec<&mut Option<Record>>>();
+            records.sort_by_key(|f| f.as_ref().unwrap().key());
+            records.reverse();
+            // 2. If records is empty, then we've merged all the files
+            if records.is_empty() {
+                break;
+            }
+            // 3. Pop the first value from the record
+            let mut next_records = vec![records.pop().unwrap().take().unwrap()];
+            for record in records {
+                if record.as_ref().unwrap().key() == next_records[0].key() {
+                    next_records.push(record.take().unwrap());
+                }
+            }
+            // 4. sort the next records by timestamp
+            next_records.sort_by_key(|f| f.timestamp());
+            let record = next_records.pop().unwrap();
+            // 5. write the value
+            let bytes = bincode::serialize(&record)?;
+            size += writer.write(&bytes)?;
+            let hint = Hint::new(&record, size - record.value().len());
+            index.insert(record.key().to_string(), hint);
+        }
+        Ok(Segment::new(index, segment_path, size))
+    }
+}
+
+#[derive(Clone)]
+struct Levels {
+    inner: Arc<RwLock<Vec<Level>>>,
+}
+
+impl Levels {
+    pub fn new(directory: impl Into<PathBuf>) -> crate::Result<Self> {
+        let directory = directory.into(); // parent directory;
+        let mut level = 2;
+        let mut levels = vec![Level::new(&directory, 1)?];
+        loop {
+            let lvl_dir = (&directory).join(format!("lv{}", level));
+            if !lvl_dir.exists() {
+                break;
+            }
+            levels.push(Level::new(lvl_dir, level)?);
+            level += 1;
+        }
+
+        Ok(Self {
+            inner: Arc::new(RwLock::new(levels)),
+        })
+    }
+
+    pub fn insert(&self, sstable: SSTable) {
+        let inner = self.inner.clone();
+        std::thread::spawn(move || {
+            // the first level always exists
+            let mut index = 0;
+            let mut storage = Storage::SSTable(sstable);
+            loop {
+                let inner = // TODO: plz
+                let next = 
+                if let Some(segment) = inner.read().unwrap().get(index).unwrap().insert(storage) {
+                    storage = segment;
+                } else {
+                    break;
+                }
+            }
+        });
+    }
+
+    pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
+        let levels = self.inner.read().unwrap();
+        for level in levels.iter() {
+            if let Some(value) = level.get(key)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+}
 
 /// KvStore stores all the data for the kvstore
 #[derive(Clone)]
 pub struct KvStore {
     directory: Pin<Box<PathBuf>>,
-    sstable: SSTable,
-    segments: Vec<Segment>,
+    sstable: Arc<RwLock<SSTable>>,
+    levels: Levels,
 }
 
 impl KvStore {
-    fn write(&self, record: Record) -> crate::Result<()> {
-        let keydir = self.key_directory.read().unwrap();
-        keydir.write(record)?;
+    fn write(&self, key: String, value: Option<String>) -> crate::Result<()> {
+        let new_size = self.sstable.read().unwrap().append(key, value)?;
 
-        // when we have finished writing, we need to check if we've hit our file
-        // limit. If we have, we need to retire the current active file and open
-        // a new one.
-        // if self.key_directory.read().unwrap().active_file_length() > 55000000 {
-        if keydir.active_file_length() > 55000000 {
-            self.immutable_files.push(keydir.active_path.clone());
-            debug!("Active file is too large, writing it to disk");
-
-            let new_file_name = format!("{}.log", Uuid::new_v4());
-            let active_file_path = self.directory.clone().join(new_file_name);
-            *self.active_path.write().unwrap() = active_file_path.clone();
-            debug!("Created new active log: {:?}", active_file_path);
-
-            drop(keydir);
-            let mut keydir = self.key_directory.write().unwrap();
-            keydir.set_active_file(active_file_path)?;
-
-            // 3. Compact
-            if self.immutable_files.len() > 10 {
-                debug!("Too many files found. Compacting them together.");
-                let mut immutable_files = self.immutable_files.clone();
-                let key_directory = self.key_directory.clone();
-                let directory = self.directory.clone();
-
-                std::thread::spawn(move || {
-                    // old paths
-                    let old_immutable_data_file_paths = immutable_files.as_paths();
-                    let old_immutable_hint_file_path = immutable_files.hint_path();
-
-                    // create merge file
-                    let name = Uuid::new_v4();
-                    let merge_path = directory.clone().join(format!("{}.log", name));
-                    let hint_path = directory.clone().join(format!("{}.hint", name));
-
-                    // build merge and hint files
-                    let keydir = immutable_files.build_state(&merge_path).unwrap();
-                    keydir.save_key_dir(&hint_path).unwrap();
-
-                    // update key directory with hint file
-                    let hint_path_pointer = immutable_files.overwrite_hint_pointer(hint_path);
-                    let data_path_pointer = key_directory
-                        .write()
-                        .unwrap()
-                        .read_in_hint_file(hint_path_pointer.clone())
-                        .unwrap();
-
-                    // overwrite immutable_files to point to the merged file
-                    immutable_files.overwrite_pointers(data_path_pointer);
-
-                    // delete all old immutable_files
-                    if let Some(old_hint_path) = old_immutable_hint_file_path {
-                        debug!("Removed old hint file: {:?}", old_hint_path);
-                        std::fs::remove_file(old_hint_path).unwrap();
-                    }
-                    for path in old_immutable_data_file_paths {
-                        if path.exists() {
-                            debug!("Removed old immutable file: {:?}", path);
-                            std::fs::remove_file(path).unwrap();
-                        }
-                    }
-                    debug!("Successfully compacted log");
-                });
-            }
+        if new_size > 256 * 1000 * 1000 {
+            // sstable is too large, rotate
+            let sstable = self.sstable.write().unwrap();
+            let old_sstable = sstable.clone();
+            *sstable = SSTable::new(*self.directory)?;
+            drop(sstable);
+            self.levels.insert(old_sstable);
         }
-
         Ok(())
+    }
+
+    pub fn add(&self, key: String, value: String) -> crate::Result<()> {
+        self.write(key, Some(value))
+    }
+
+    pub fn remove(&self, key: String) -> crate::Result<()> {
+        self.write(key, None)
     }
 }
 
@@ -117,54 +270,34 @@ impl KvsEngine for KvStore {
             }
         }
 
-        let immutable_files = ImmutableFiles::new(directory.as_path())?;
-        let log_file_path = directory.clone().join(format!("{}.log", Uuid::new_v4()));
-        let key_directory = immutable_files.build_state(&log_file_path)?;
+        let levels = Levels::new(directory.as_path())?;
+        let sstable = SSTable::new(&directory)?;
 
-        let store = Self {
-            immutable_files,
-            directory: Pin::new(Box::new(directory)),
-            active_path: Arc::new(RwLock::new(log_file_path.clone())),
-            key_directory: Arc::new(RwLock::new(key_directory)),
-        };
         info!("State read, application ready for requests");
-        Ok(store)
+        Ok(Self {
+            directory: Pin::new(Box::new(directory)),
+            sstable: Arc::new(RwLock::new(sstable)),
+            levels,
+        })
     }
 
     fn set(&self, key: String, value: String) -> crate::Result<()> {
-        let record = Record::new(key, Some(value));
-        self.write(record)
+        self.add(key, value)
     }
 
     fn get(&self, key: String) -> crate::Result<Option<String>> {
-        let keydir = self.key_directory.read().unwrap().find(&key)?;
-        let keydir_lock = keydir.read().unwrap();
-        // Check if we are reading from the active file. If we are, we need to
-        // flush the writer so that we know for sure that all changes have been
-        // committed to disk.
-        let file_id = &*keydir_lock.file_id.read().unwrap();
-        let active_path = &*self.active_path.read().unwrap();
-        if file_id == active_path {
-            debug!("Reading from active file. Flushing write buffer");
-            self.key_directory.read().unwrap().flush()?;
+        match self.sstable.read().unwrap().get(&key) {
+            Some(value) => Ok(Some(value)),
+            None => match self.levels.get(&key)? {
+                Some(value) => Ok(Some(value)),
+                None => Err(KvError::KeyNotFound(
+                    format!("Key {:?} could not be found", key).into(),
+                )),
+            },
         }
-        let mut reader = BufReader::new(File::open(file_id.as_path())?);
-        let mut value = vec![0u8; keydir_lock.value_size];
-        let seek_position: i64 = keydir_lock.value_position.try_into().unwrap();
-        debug!(
-            "Reading from string ({} to {}) in file: {:?}",
-            seek_position,
-            seek_position + keydir_lock.value_size as i64,
-            file_id.as_path()
-        );
-        reader.seek_relative(seek_position)?;
-        reader.read(&mut value)?;
-        Ok(Some(String::from_utf8(value).unwrap()))
     }
 
     fn remove(&self, key: String) -> crate::Result<()> {
-        self.key_directory.read().unwrap().find(&key)?;
-        let record = Record::new(key, None);
-        self.write(record)
+        self.remove(key)
     }
 }

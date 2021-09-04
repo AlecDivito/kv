@@ -1,13 +1,39 @@
-use std::{collections::{BTreeMap, HashMap}, fs::File, io::{BufRead, BufReader, BufWriter, Write}, path::PathBuf, pin::Pin, sync::{Arc, Mutex, RwLock}};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs::File,
+    io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, Mutex, RwLock},
+};
 
 use crc::{Crc, CRC_32_ISCSI};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{common::now, KvError};
+use crate::common::now;
+
+#[derive(Clone, Default, Deserialize, Serialize, Debug)]
+pub struct Hint {
+    timestamp: u128,
+    value_size: usize,
+    value_position: usize,
+    key: String,
+}
+
+impl Hint {
+    pub fn new(record: &Record, value_position: usize) -> Self {
+        Self {
+            timestamp: record.timestamp,
+            value_size: record.value().len(),
+            value_position,
+            key: record.key.clone(),
+        }
+    }
+}
 
 #[derive(Default, Deserialize, Serialize, Debug)]
-struct Record {
+pub struct Record {
     crc: u32,
     timestamp: u128,
     key: String,
@@ -41,12 +67,20 @@ impl Record {
         digest.finalize()
     }
 
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
     pub fn value(&self) -> String {
         self.value.clone().unwrap_or("".to_string())
     }
 
     pub fn is_delete_record(&self) -> bool {
         self.value.is_none()
+    }
+
+    pub(crate) fn timestamp(&self) -> u128 {
+        self.timestamp
     }
 }
 
@@ -64,6 +98,9 @@ impl std::fmt::Display for Record {
 }
 
 #[derive(Clone)]
+/// MemoryTable keeps a tree of key and values in sorted order. Once it reaches
+/// a certian size, the table is moved to disk and a new empty one would take
+/// its place.
 struct MemoryTable {
     inner: Arc<RwLock<BTreeMap<String, Option<String>>>>,
     size: Arc<RwLock<usize>>,
@@ -96,7 +133,7 @@ impl MemoryTable {
         Ok(table)
     }
 
-    fn append(&self, record: Record) {
+    fn append(&self, record: Record) -> usize {
         trace!("Appending {}", &record);
         let mut size = self.size.write().unwrap();
         let mut map = self.inner.write().unwrap();
@@ -106,15 +143,14 @@ impl MemoryTable {
             Some(old_value) => (*size - old_value.unwrap_or("".into()).len()) + value_size,
             None => *size + key_size + value_size,
         };
+        *size
     }
 
-    fn get(&self, key: &str) -> crate::Result<Option<String>> {
+    fn get(&self, key: &str) -> Option<String> {
         let map = self.inner.read().unwrap();
         match map.get(key) {
-            Some(value) => Ok(value.clone()),
-            None => Err(KvError::KeyNotFound(
-                format!("Key {:?} could not be found", key).into(),
-            )),
+            Some(value) => value.clone(),
+            None => None,
         }
     }
 
@@ -123,14 +159,20 @@ impl MemoryTable {
     }
 
     fn drain_to_segment(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
+        let mut index = HashMap::new();
         let writer = BufWriter::new(File::create(&path.into())?);
         let table = self.inner.read().unwrap();
+        let file_size = 0;
         for (key, value) in table.iter() {
             let record = Record::new(key.clone(), value.clone());
             let bytes = bincode::serialize(&record)?;
-            writer.write(&bytes)?;
+            file_size += writer.write(&bytes)?;
+            let hint = Hint::new(&record, file_size - record.value().len());
+            index.insert(record.key, hint);
         }
-        Ok(())
+        drop(table);
+        self.inner.write().unwrap().clear();
+        Ok(Segment::new(index, path, file_size))
     }
 }
 
@@ -147,9 +189,9 @@ pub struct SSTable {
 impl SSTable {
     /// Create a new SSTable and pass the directory in where a write-ahead-log
     /// should be created to save data on write.
-    pub fn from_directory(directory: impl Into<PathBuf>) -> crate::Result<Self> {
+    pub fn new(directory: impl Into<PathBuf>) -> crate::Result<Self> {
         let directory = directory.into();
-        let path = directory.join(format!("{}.wal", Uuid::new_v4()));
+        let path = (&directory).join(format!("{}.log", Uuid::new_v4()));
         let writer = BufWriter::new(File::create(&path)?);
         Ok(Self {
             inner: MemoryTable::new(),
@@ -172,30 +214,22 @@ impl SSTable {
     }
 
     /// Append a key value to the SSTable and write it to our log
-    pub fn append(&self, key: String, value: Option<String>) -> crate::Result<()> {
+    pub fn append(&self, key: String, value: Option<String>) -> crate::Result<usize> {
         let record = Record::new(key, value);
         let bytes = bincode::serialize(&record)?;
         self.write_ahead_log.lock().unwrap().write(&bytes)?;
-        self.inner.append(record);
-        Ok(())
+        Ok(self.inner.append(record))
     }
 
     /// Check to see if a key exists inside of the SSTable
-    pub fn get(&self, key: &str) -> crate::Result<String> {
-        match self.inner.get(key)? {
-            Some(key) => Ok(key.clone()),
-            None => Err(KvError::KeyNotFound(
-                format!("Key {:?} could not be found", key).into(),
-            )),
-        }
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.inner.get(key)
     }
 
     /// Rotate the SSTable from memory onto disk as segment file. Return the path
     /// to the new segment file.
-    pub fn rotate(&self) -> crate::Result<Segment> {
-        let mut segment_log_path = PathBuf::from(self.write_ahead_log_path.as_path());
-        segment_log_path.set_extension("table");
-        Ok(self.inner.drain_to_segment(&segment_log_path)?);
+    pub fn rotate(&self, segment_path: impl Into<PathBuf>) -> crate::Result<Segment> {
+        self.inner.drain_to_segment(segment_path)
     }
 
     /// Get the size in bytes of the current SSTable
@@ -207,7 +241,94 @@ impl SSTable {
 #[derive(Clone)]
 /// An index that maps records in a file a log file keys  
 pub struct Segment {
-    index: Pin<Box<HashMap<String, Hint>>,
+    index: Pin<Box<HashMap<String, Hint>>>,
     segment_path: Pin<Box<PathBuf>>,
     size: Pin<Box<usize>>,
+}
+
+impl Segment {
+    pub fn new(
+        index: HashMap<String, Hint>,
+        segment_path: impl Into<PathBuf>,
+        size: usize,
+    ) -> Self {
+        Self {
+            index: Pin::new(Box::new(index)),
+            segment_path: Pin::new(Box::new(segment_path.into())),
+            size: Pin::new(Box::new(size)),
+        }
+    }
+
+    pub fn from_log(path: impl Into<PathBuf>) -> crate::Result<Segment> {
+        let segment_path = path.into();
+        let mut size = 0;
+        let mut index = HashMap::new();
+        let mut reader = BufReader::new(File::open(&segment_path)?);
+        while reader.fill_buf().unwrap().len() != 0 {
+            let record: Record = bincode::deserialize_from(&mut reader).unwrap();
+            size += bincode::serialized_size(&record)? as usize;
+            if record.crc != record.calculate_crc() {
+                let actual_crc = record.calculate_crc();
+                trace!("{} is corrupt (Actual {})", record, actual_crc);
+                continue;
+            }
+            let hint = Hint::new(&record, size - record.value().len());
+            index.insert(record.key, hint);
+        }
+        Ok(Self::new(index, segment_path, size))
+    }
+
+    pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
+        let hint = match self.index.get(key) {
+            Some(hint) => hint,
+            None => return Ok(None),
+        };
+        let mut reader = BufReader::new(File::open(*self.segment_path)?);
+        let mut value = vec![0u8; hint.value_size];
+        debug!("Reading {} from {:?}", key, self.segment_path);
+        reader.seek(SeekFrom::Start(hint.value_position as u64))?;
+        reader.read(&mut value)?;
+        Ok(Some(String::from_utf8(value).unwrap()))
+    }
+
+    pub fn open(&self) -> crate::Result<BufReader<File>> {
+        Ok(BufReader::new(File::open(*self.segment_path)?))
+    }
+}
+
+pub struct SegmentReader {
+    reader: BufReader<File>,
+    value: Option<Record>,
+}
+
+impl SegmentReader {
+    pub fn new(segment: &Segment) -> crate::Result<Self> {
+        let reader = segment.open()?;
+        let mut segment_reader = Self {
+            reader,
+            value: None,
+        };
+        Ok(segment_reader)
+    }
+
+    pub fn next(&mut self) -> crate::Result<()> {
+        if self.value.is_none() {
+            if !self.done() {
+                self.value = Some(bincode::deserialize_from(self.reader)?)
+            }
+        }
+        Ok(())
+    }
+
+    pub fn take(&mut self) -> Option<Record> {
+        self.value.take()
+    }
+
+    pub fn peek(&self) -> &mut Option<Record> {
+        &mut self.value
+    }
+
+    pub fn done(&mut self) -> bool {
+        self.reader.fill_buf().unwrap().len() == 0 && self.value.is_none()
+    }
 }
