@@ -36,9 +36,13 @@ pub trait KvsEngine: Clone + Send + Sync {
     fn remove(&self, key: String) -> Result<()>;
 }
 
+mod sstable;
+
 /// kvs is this libraries implementation of a key value store
 // pub mod kvs;
 pub mod kvs2;
+
+pub mod kvs3;
 
 /// sled is a already implemented library in rust
 pub mod sled;
