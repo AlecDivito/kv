@@ -295,9 +295,11 @@ impl Levels {
                 trace!("level folder does not exist. Creating {:?}", &next_path);
                 std::fs::create_dir(&next_path)?;
             }
-            let level = match self.inner.read()?.get(index) {
+            let inner = self.inner.read()?;
+            let level = match inner.get(index) {
                 Some(level) => level.clone(),
                 None => {
+                    drop(inner);
                     let level = Level::new(&*directory, level_index)?;
                     self.inner.write()?.push(level.clone());
                     level
