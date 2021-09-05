@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs::File,
     io::{BufWriter, Write},
     path::PathBuf,
@@ -43,7 +44,7 @@ impl std::fmt::Display for Storage {
 }
 
 #[derive(Clone)]
-struct Level {
+pub struct Level {
     level: Pin<Box<usize>>,
     directory: Pin<PathBuf>,
     segments: Arc<RwLock<Vec<Storage>>>,
@@ -60,7 +61,8 @@ impl Level {
             if entry.path().is_dir() {
                 continue;
             }
-            if !entry.path().ends_with("log") {
+            let path = entry.path();
+            if path.extension().unwrap_or(OsStr::new("")) != "log" {
                 continue;
             }
             trace!("Added {:?} to level {}", entry.path(), level);
@@ -82,7 +84,7 @@ impl Level {
             segments.push(Storage::Segment(Segment::from_log(path)?));
         }
 
-        trace!("Level {} indices set {:?}", level, segments);
+        debug!("Level {} indices set {:?}", level, segments);
         Ok(Self {
             directory: Pin::new(directory),
             level: Pin::new(Box::new(level)),
@@ -90,18 +92,38 @@ impl Level {
         })
     }
 
-    pub fn save_sstables(&self, next_path: impl Into<PathBuf>) -> crate::Result<Option<Segment>> {
+    /// Update level mainly does 2 operations. The first is to find any SSTable
+    /// and convert it into a Segment with an index. After which, it will resave
+    /// it to the level as a segment.
+    ///
+    /// With the level having the correct state, it then tries to merge it's file
+    /// if, and only if, it reaches the given threshold.
+    pub fn update_level(&self, next_path: impl Into<PathBuf>) -> crate::Result<Option<Segment>> {
         let segments = self.segments.try_read()?;
-        for (index, segment) in segments.iter().enumerate() {
-            if let Storage::SSTable(s) = segment {
-                let new_segment = s.save(self.directory.join(format!("{}.log", now())))?;
-                drop(segments);
-                self.segments.write().unwrap()[index] = Storage::Segment(new_segment);
-                break;
-            };
+        let length = segments.len();
+        if let Some((index, table)) = segments.iter().enumerate().find_map(|(u, s)| {
+            if let Some(t) = s.sstable() {
+                Some((u, t))
+            } else {
+                None
+            }
+        }) {
+            let new_segment = table.save(self.directory.join(format!("{}.log", now())))?;
+            trace!("Created new {} from {}", new_segment, table);
+            let length = segments.len();
+            drop(segments);
+            self.segments.write().unwrap()[index] = Storage::Segment(new_segment);
+            trace!(
+                "Level {} segments have been updated to {}",
+                self.level,
+                length
+            );
+        } else {
+            drop(segments);
         }
 
-        Ok(if self.segments.try_read()?.len() >= 5 {
+        trace!("Level {}: Segments before merge {}", self.level, length);
+        Ok(if length > clamp(10 * (*self.level), 2) {
             let merge = self.merge(next_path)?;
             Some(merge)
         } else {
@@ -110,8 +132,12 @@ impl Level {
     }
 
     pub fn add(&self, storage: Storage) -> crate::Result<()> {
-        trace!("Adding {} to {:?}", storage, self.segments.try_read()?);
-        self.segments.try_write()?.push(storage);
+        trace!(
+            "Adding {} to {:?}",
+            storage,
+            self.segments.try_read()?.len()
+        );
+        self.segments.write().unwrap().push(storage);
         Ok(())
     }
 
@@ -128,20 +154,26 @@ impl Level {
     }
 
     fn merge(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
-        let mut segments = self
-            .segments
-            .try_read()?
+        let segment_path = path.into().join(format!("{}.log", now()));
+        info!("Merging level {} into {:?}", self.level, &segment_path);
+        let segments_lock = self.segments.read().unwrap();
+        let mut segments = segments_lock
             .iter()
             .enumerate()
-            .filter(|(index, s)| s.segment().is_some())
+            .filter(|(_, s)| s.segment().is_some())
             .map(|(index, s)| (index, SegmentReader::new(s.segment().unwrap())))
-            .filter(|(index, reader)| reader.is_ok())
+            .filter(|(_, reader)| reader.is_ok())
             .map(|(index, reader)| (index, reader.unwrap()))
             .collect::<Vec<(usize, SegmentReader)>>();
+        trace!(
+            "Of {} segments, found {} which are readable",
+            segments_lock.len(),
+            segments.len()
+        );
+        drop(segments_lock);
 
         let mut index = HashMap::new();
         let mut size = 0;
-        let segment_path = path.into().join(format!("{}.log", now()));
         let mut writer = BufWriter::new(File::create(&segment_path)?);
         loop {
             for reader in segments.iter_mut() {
@@ -152,28 +184,34 @@ impl Level {
             // remember that files do not have dulicates
             let mut records = segments
                 .iter_mut()
-                .map(|f| f.1.peek())
-                .filter(|f| f.is_none())
+                .filter(|f| f.1.value.is_some())
+                .map(|f| &mut f.1.value)
                 .collect::<Vec<&mut Option<Record>>>();
             records.sort_by_key(|f| f.as_ref().unwrap().key().to_string());
             records.reverse();
 
             // 2. If records is empty, then we've merged all the files
             if records.is_empty() {
+                trace!("Records is empty. All files have successfully been compacted");
                 break;
             }
 
             // 3. Pop the first value from the record
-            let mut next_records = vec![records.pop().unwrap().take().unwrap()];
+            let lowest = records.pop().unwrap().take().unwrap();
+            trace!("Lowest record found was {}", lowest);
+            let mut next_records = vec![lowest];
             for record in records {
                 if record.as_ref().unwrap().key() == next_records[0].key() {
-                    next_records.push(record.take().unwrap());
+                    let r = record.take().unwrap();
+                    trace!("Found same record: {}", r);
+                    next_records.push(r);
                 }
             }
 
             // 4. sort the next records by timestamp, save the one with the highest timestamp
             next_records.sort_by_key(|f| f.timestamp());
             let record = next_records.pop().unwrap();
+            trace!("Appending {} to {:?}", record, &segment_path);
 
             // 5. write the value
             let bytes = bincode::serialize(&record)?;
@@ -183,10 +221,20 @@ impl Level {
         }
 
         let mut indexies = segments.iter().map(|i| &i.0).collect::<Vec<&usize>>();
+        trace!(
+            "Level {}: Removing old indices from segments {:?}",
+            self.level,
+            indexies
+        );
         indexies.sort();
 
-        let mut lock = self.segments.try_write()?;
+        let mut lock = self.segments.write().unwrap();
         for index in indexies.iter().rev() {
+            trace!(
+                "Level {}: Removing segment {}",
+                self.level,
+                lock.get(**index).unwrap()
+            );
             lock.remove(**index);
         }
         drop(lock);
@@ -197,6 +245,14 @@ impl Level {
 
         // When segment readers drop, we delete the files they we're reading.
         Ok(Segment::new(index, segment_path, size))
+    }
+}
+
+fn clamp(level: usize, min: usize) -> usize {
+    if level < min {
+        min
+    } else {
+        level
     }
 }
 
@@ -226,37 +282,47 @@ impl Levels {
         })
     }
 
-    pub fn try_merge(&self) {
-        let directory = (self.directory.read().unwrap()).clone();
+    pub fn try_merge(&self) -> crate::Result<()> {
+        let directory = (self.directory.read()?).clone();
         let mut index = 0;
         let mut level_index = 2;
-        let mut next_path = (&directory).join(format!("lv{}", level_index));
-        if !next_path.exists() {
-            std::fs::create_dir(&next_path).unwrap();
-        }
-        let mut new_segment_file = self.inner.read().unwrap()[0]
-            .save_sstables(&next_path)
-            .unwrap();
+        let mut new_segment_file = None;
+
         loop {
-            if new_segment_file.is_none() {
-                return;
+            let next_path = (&*directory).join(format!("lv{}", level_index));
+
+            if !next_path.exists() {
+                trace!("level folder does not exist. Creating {:?}", &next_path);
+                std::fs::create_dir(&next_path)?;
             }
-            let level = match self.inner.read().unwrap().get(index) {
+            let level = match self.inner.read()?.get(index) {
                 Some(level) => level.clone(),
                 None => {
-                    let level = Level::new(&*directory, level_index).unwrap();
-                    self.inner.write().unwrap().push(level.clone());
+                    let level = Level::new(&*directory, level_index)?;
+                    self.inner.write()?.push(level.clone());
                     level
                 }
             };
-            level_index += 1;
-            index += 1;
+            if let Some(segment) = new_segment_file.take() {
+                trace!("Attempting to merge index level {}", index);
+                level.add(Storage::Segment(segment))?;
+            }
+            new_segment_file = level.update_level(next_path)?;
+            if new_segment_file.is_none() {
+                info!(
+                    "Stopping merging at index level {} because no more merging is needed",
+                    index
+                );
+                return Ok(());
+            } else {
+                info!(
+                    "New segment file has been pushed to index {}. Continueing merge.",
+                    index
+                );
+            }
 
-            next_path = (&*directory).join(format!("lv{}", level_index));
-            level
-                .add(Storage::Segment(new_segment_file.take().unwrap()))
-                .unwrap();
-            new_segment_file = level.save_sstables(next_path).unwrap();
+            level_index = level_index + 1;
+            index = index + 1;
         }
     }
 
@@ -271,7 +337,7 @@ impl Levels {
     }
 
     pub fn add_table(&self, sstable: SSTable) -> crate::Result<()> {
-        self.inner.write().unwrap()[0].add(Storage::SSTable(sstable))?;
+        self.inner.read().unwrap()[0].add(Storage::SSTable(sstable))?;
         Ok(())
     }
 }
@@ -288,7 +354,7 @@ impl KvStore {
     fn write(&self, key: String, value: Option<String>) -> crate::Result<()> {
         let new_size = self.sstable.read().unwrap().append(key, value)?;
 
-        if new_size > 128
+        if new_size > 1048
         /*  * 1000 * 1000 */
         {
             // sstable is too large, rotate
@@ -299,7 +365,13 @@ impl KvStore {
             drop(sstable);
             self.levels.add_table(old_sstable)?;
             let levels = self.levels.clone();
-            std::thread::spawn(move || levels.try_merge());
+            std::thread::spawn(move || {
+                if let Err(e) = levels.try_merge() {
+                    error!("Failed to succesfully merge with error {}", e)
+                } else {
+                    info!("Successfully merged levels together");
+                }
+            });
         }
         Ok(())
     }

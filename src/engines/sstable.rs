@@ -320,7 +320,7 @@ impl Segment {
     }
 
     pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
-        trace!("Searching for {} in {:?}", key, self.segment_path);
+        debug!("Searching for {} in {:?}", key, self.segment_path);
         let hint = match self.index.get(key) {
             Some(hint) => hint,
             None => {
@@ -340,7 +340,7 @@ impl std::fmt::Display for Segment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Segment({} bytes, {} indicies {:?}): ",
+            "Segment({} bytes, {} indicies -> {:?}) ",
             self.size,
             self.index.len(),
             self.segment_path
@@ -348,11 +348,17 @@ impl std::fmt::Display for Segment {
     }
 }
 
+impl Drop for Segment {
+    fn drop(&mut self) {
+        debug!("Dropped {}", self);
+    }
+}
+
 pub struct SegmentReader {
     path: PathBuf,
     reader: BufReader<File>,
-    value: Option<Record>,
     complete: bool,
+    pub value: Option<Record>,
 }
 
 impl SegmentReader {
@@ -377,10 +383,6 @@ impl SegmentReader {
             }
         }
         Ok(())
-    }
-
-    pub fn peek(&mut self) -> &mut Option<Record> {
-        &mut self.value
     }
 
     pub fn done(&mut self) -> bool {
