@@ -48,13 +48,13 @@ impl<E: KvsEngine> KvServer<E> {
                 let response = $resp;
                 serde_json::to_writer(&mut writer, &response)?;
                 writer.flush()?;
-                debug!("Response sent to {}: {:?}", peer_addr, response);
+                // debug!("Response sent to {}: {:?}", peer_addr, response);
             };};
         }
 
         for req in req_reader {
             let req = req?;
-            debug!("Receive request from {}: {:?}", peer_addr, req);
+            // info!("Receive request from {}: {:?}", peer_addr, req);
             match req {
                 Request::Get { key } => send_response!(match self.engine.get(key) {
                     Ok(v) => GetResponse::Ok(v),

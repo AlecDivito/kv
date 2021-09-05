@@ -32,6 +32,16 @@ impl Hint {
     }
 }
 
+impl std::fmt::Display for Hint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Hint({}): ({}, {}, {})",
+            self.key, self.timestamp, self.value_position, self.value_size
+        )
+    }
+}
+
 #[derive(Default, Deserialize, Serialize, Debug)]
 pub struct Record {
     crc: u32,
@@ -75,10 +85,6 @@ impl Record {
         self.value.clone().unwrap_or("".to_string())
     }
 
-    pub fn is_delete_record(&self) -> bool {
-        self.value.is_none()
-    }
-
     pub(crate) fn timestamp(&self) -> u128 {
         self.timestamp
     }
@@ -97,7 +103,7 @@ impl std::fmt::Display for Record {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 /// MemoryTable keeps a tree of key and values in sorted order. Once it reaches
 /// a certian size, the table is moved to disk and a new empty one would take
 /// its place.
@@ -115,11 +121,13 @@ impl MemoryTable {
     }
 
     fn from_write_ahead_log(path: impl Into<PathBuf>) -> crate::Result<Self> {
+        let path = path.into();
+        debug!("Building memory table from redo log {:?}", &path);
         let table = Self {
             inner: Arc::new(RwLock::new(BTreeMap::new())),
             size: Arc::new(RwLock::new(0)),
         };
-        let mut reader = BufReader::new(File::open(path.into())?);
+        let mut reader = BufReader::new(File::open(path)?);
         while reader.fill_buf().unwrap().len() != 0 {
             let record: Record = bincode::deserialize_from(&mut reader).unwrap();
             if record.crc != record.calculate_crc() {
@@ -134,9 +142,9 @@ impl MemoryTable {
     }
 
     fn append(&self, record: Record) -> usize {
-        trace!("Appending {}", &record);
         let mut size = self.size.write().unwrap();
         let mut map = self.inner.write().unwrap();
+        trace!("Memory Size {}: Appending {}", size, &record);
         let value_size = record.value().len();
         let key_size = record.key.len();
         *size = match map.insert(record.key, record.value) {
@@ -154,12 +162,9 @@ impl MemoryTable {
         }
     }
 
-    fn size(&self) -> usize {
-        *self.size.read().unwrap()
-    }
-
     fn drain_to_segment(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
         let path = path.into();
+        debug!("Draining memory table to segment {:?}", path);
         let mut index = HashMap::new();
         let mut writer = BufWriter::new(File::create(&path)?);
         let mut file_size = 0;
@@ -169,6 +174,7 @@ impl MemoryTable {
             let bytes = bincode::serialize(&record)?;
             file_size += writer.write(&bytes)?;
             let hint = Hint::new(&record, file_size - record.value().len());
+            trace!("Wrote {} to segment, added {} to index", record, hint);
             index.insert(record.key, hint);
         }
         drop(table);
@@ -177,7 +183,18 @@ impl MemoryTable {
     }
 }
 
-#[derive(Clone)]
+impl std::fmt::Display for MemoryTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MemoryTable(Size: {}, entries: {})",
+            self.size.read().unwrap(),
+            self.inner.read().unwrap().len()
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
 /// SSTable stores records in a sorted order that a user has submitted to be
 /// saved inside of the key value store. A write-ahead-log is also written to
 /// disk just in case the database goes offline during operation.
@@ -192,7 +209,7 @@ impl SSTable {
     /// should be created to save data on write.
     pub fn new(directory: impl Into<PathBuf>) -> crate::Result<Self> {
         let directory = directory.into();
-        let path = (&directory).join(format!("{}.log", Uuid::new_v4()));
+        let path = (&directory).join(format!("{}.redo", Uuid::new_v4()));
         let writer = BufWriter::new(File::create(&path)?);
         Ok(Self {
             inner: MemoryTable::new(),
@@ -218,7 +235,10 @@ impl SSTable {
     pub fn append(&self, key: String, value: Option<String>) -> crate::Result<usize> {
         let record = Record::new(key, value);
         let bytes = bincode::serialize(&record)?;
-        self.write_ahead_log.lock().unwrap().write(&bytes)?;
+        let mut lock = self.write_ahead_log.lock().unwrap();
+        lock.write(&bytes)?;
+        lock.flush()?;
+        drop(lock);
         Ok(self.inner.append(record))
     }
 
@@ -232,14 +252,30 @@ impl SSTable {
     pub fn save(&self, segment_path: impl Into<PathBuf>) -> crate::Result<Segment> {
         self.inner.drain_to_segment(segment_path)
     }
+}
 
-    /// Get the size in bytes of the current SSTable
-    pub fn size(&self) -> usize {
-        self.inner.size()
+impl std::fmt::Display for SSTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SSTable({}, {:?})",
+            self.inner, self.write_ahead_log_path
+        )
     }
 }
 
-#[derive(Clone)]
+impl Drop for SSTable {
+    fn drop(&mut self) {
+        let path = self.write_ahead_log_path.as_path();
+        trace!("Attempting to remove redo log {:?}", &path);
+        match std::fs::remove_file(path) {
+            Ok(_) => info!("Successfully removed redo log {:?}", &path),
+            Err(e) => error!("Failed to remove redo log {:?} with error {:?}", &path, e),
+        };
+    }
+}
+
+#[derive(Clone, Debug)]
 /// An index that maps records in a file a log file keys  
 pub struct Segment {
     index: Pin<Box<HashMap<String, Hint>>>,
@@ -253,15 +289,18 @@ impl Segment {
         segment_path: impl Into<PathBuf>,
         size: usize,
     ) -> Self {
+        let path = segment_path.into();
+        debug!("Create new Segment with {} items {:?}", index.len(), &path);
         Self {
             index: Pin::new(Box::new(index)),
-            segment_path: Pin::new(Box::new(segment_path.into())),
+            segment_path: Pin::new(Box::new(path)),
             size: Pin::new(Box::new(size)),
         }
     }
 
     pub fn from_log(path: impl Into<PathBuf>) -> crate::Result<Segment> {
         let segment_path = path.into();
+        debug!("Reading segment from log: {:?}", &segment_path);
         let mut size = 0;
         let mut index = HashMap::new();
         let mut reader = BufReader::new(File::open(&segment_path)?);
@@ -274,22 +313,38 @@ impl Segment {
                 continue;
             }
             let hint = Hint::new(&record, size - record.value().len());
+            trace!("Read record {}, adding {} to hashmap", &record, &hint);
             index.insert(record.key, hint);
         }
         Ok(Self::new(index, segment_path, size))
     }
 
     pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
+        trace!("Searching for {} in {:?}", key, self.segment_path);
         let hint = match self.index.get(key) {
             Some(hint) => hint,
-            None => return Ok(None),
+            None => {
+                trace!("Key {} not found in {:?}", key, self.segment_path);
+                return Ok(None);
+            }
         };
         let mut reader = BufReader::new(File::open(&*self.segment_path)?);
         let mut value = vec![0u8; hint.value_size];
-        debug!("Reading {} from {:?}", key, self.segment_path);
         reader.seek(SeekFrom::Start(hint.value_position as u64))?;
         reader.read(&mut value)?;
         Ok(Some(String::from_utf8(value).unwrap()))
+    }
+}
+
+impl std::fmt::Display for Segment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Segment({} bytes, {} indicies {:?}): ",
+            self.size,
+            self.index.len(),
+            self.segment_path
+        )
     }
 }
 
@@ -297,43 +352,51 @@ pub struct SegmentReader {
     path: PathBuf,
     reader: BufReader<File>,
     value: Option<Record>,
+    complete: bool,
 }
 
 impl SegmentReader {
     pub fn new(segment: &Segment) -> crate::Result<Self> {
+        trace!("Creating segment reader from {}", segment);
         let path = (*segment.segment_path).clone();
         let reader = BufReader::new(File::open(&path)?);
         Ok(Self {
             path,
             reader,
             value: None,
+            complete: false,
         })
     }
 
     pub fn next(&mut self) -> crate::Result<()> {
         if self.value.is_none() {
             if !self.done() {
-                self.value = Some(bincode::deserialize_from(&mut self.reader)?)
+                let record = bincode::deserialize_from(&mut self.reader)?;
+                trace!("Found next {} in {:?}", record, self.path);
+                self.value.insert(record);
             }
         }
         Ok(())
     }
 
-    pub fn take(&mut self) -> Option<Record> {
-        self.value.take()
-    }
-
-    pub fn peek(&self) -> &mut Option<Record> {
+    pub fn peek(&mut self) -> &mut Option<Record> {
         &mut self.value
     }
 
     pub fn done(&mut self) -> bool {
         self.reader.fill_buf().unwrap().len() == 0 && self.value.is_none()
     }
+
+    pub fn complete(&mut self) {
+        self.complete = true;
+    }
 }
 
 impl Drop for SegmentReader {
     fn drop(&mut self) {
-        todo!()
+        if self.complete {
+            trace!("Dropping segment reader {:?}. Deleting file.", &self.path);
+            std::fs::remove_file(&self.path).unwrap();
+        }
     }
 }

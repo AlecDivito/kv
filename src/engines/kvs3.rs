@@ -11,7 +11,8 @@ use crate::{common::now, engines::sstable::Hint, KvError, KvsEngine};
 
 use super::sstable::{Record, SSTable, Segment, SegmentReader};
 
-enum Storage {
+#[derive(Debug)]
+pub enum Storage {
     SSTable(SSTable),
     Segment(Segment),
 }
@@ -32,14 +33,25 @@ impl Storage {
     }
 }
 
+impl std::fmt::Display for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Storage::SSTable(s) => write!(f, "Storage({})", s),
+            Storage::Segment(s) => write!(f, "Storage({})", s),
+        }
+    }
+}
+
+#[derive(Clone)]
 struct Level {
     level: Pin<Box<usize>>,
     directory: Pin<PathBuf>,
-    segments: Pin<Box<Vec<Storage>>>,
+    segments: Arc<RwLock<Vec<Storage>>>,
 }
 
 impl Level {
     pub fn new(directory: impl Into<PathBuf>, level: usize) -> crate::Result<Self> {
+        debug!("Finding all files being added to level {}", level);
         let directory = directory.into();
         let dirs = std::fs::read_dir(&directory)?;
         let mut log_paths = vec![];
@@ -51,6 +63,7 @@ impl Level {
             if !entry.path().ends_with("log") {
                 continue;
             }
+            trace!("Added {:?} to level {}", entry.path(), level);
             log_paths.push(entry.path());
         }
         // sort log paths by their file stem number
@@ -63,44 +76,47 @@ impl Level {
                 .unwrap()
         });
 
+        trace!("Logs are sorted {:?}", log_paths);
         let mut segments = vec![];
         for path in log_paths {
             segments.push(Storage::Segment(Segment::from_log(path)?));
         }
 
+        trace!("Level {} indices set {:?}", level, segments);
         Ok(Self {
             directory: Pin::new(directory),
             level: Pin::new(Box::new(level)),
-            segments: Pin::new(Box::new(segments)),
+            segments: Arc::new(RwLock::new(segments)),
         })
     }
 
-    pub fn save_sstables(
-        &mut self,
-        next_path: impl Into<PathBuf>,
-    ) -> crate::Result<Option<Segment>> {
-        for segment in self.segments.iter_mut() {
+    pub fn save_sstables(&self, next_path: impl Into<PathBuf>) -> crate::Result<Option<Segment>> {
+        let segments = self.segments.try_read()?;
+        for (index, segment) in segments.iter().enumerate() {
             if let Storage::SSTable(s) = segment {
                 let new_segment = s.save(self.directory.join(format!("{}.log", now())))?;
-                *segment = Storage::Segment(new_segment);
+                drop(segments);
+                self.segments.write().unwrap()[index] = Storage::Segment(new_segment);
+                break;
             };
         }
 
-        Ok(if self.segments.len() >= 5 {
+        Ok(if self.segments.try_read()?.len() >= 5 {
             let merge = self.merge(next_path)?;
-            self.segments.clear();
             Some(merge)
         } else {
             None
         })
     }
 
-    pub fn add(&mut self, storage: Storage) {
-        self.segments.push(storage);
+    pub fn add(&self, storage: Storage) -> crate::Result<()> {
+        trace!("Adding {} to {:?}", storage, self.segments.try_read()?);
+        self.segments.try_write()?.push(storage);
+        Ok(())
     }
 
     pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
-        for level in self.segments.iter().rev() {
+        for level in self.segments.try_read()?.iter().rev() {
             if let Some(value) = match level {
                 Storage::SSTable(s) => s.get(key),
                 Storage::Segment(s) => s.get(key)?,
@@ -112,27 +128,31 @@ impl Level {
     }
 
     fn merge(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
-        let mut readers = self
+        let mut segments = self
             .segments
+            .try_read()?
             .iter()
-            .filter_map(|o| o.segment())
-            .filter_map(|segment| SegmentReader::new(segment).ok())
-            .collect::<Vec<SegmentReader>>();
+            .enumerate()
+            .filter(|(index, s)| s.segment().is_some())
+            .map(|(index, s)| (index, SegmentReader::new(s.segment().unwrap())))
+            .filter(|(index, reader)| reader.is_ok())
+            .map(|(index, reader)| (index, reader.unwrap()))
+            .collect::<Vec<(usize, SegmentReader)>>();
 
         let mut index = HashMap::new();
         let mut size = 0;
-        let segment_path = path.into();
+        let segment_path = path.into().join(format!("{}.log", now()));
         let mut writer = BufWriter::new(File::create(&segment_path)?);
         loop {
-            for reader in &mut readers {
-                reader.next()?;
+            for reader in segments.iter_mut() {
+                reader.1.next()?;
             }
 
             // 1. Find the keys with the lowest
             // remember that files do not have dulicates
-            let mut records = readers
+            let mut records = segments
                 .iter_mut()
-                .map(|f| f.peek())
+                .map(|f| f.1.peek())
                 .filter(|f| f.is_none())
                 .collect::<Vec<&mut Option<Record>>>();
             records.sort_by_key(|f| f.as_ref().unwrap().key().to_string());
@@ -160,6 +180,19 @@ impl Level {
             size += writer.write(&bytes)?;
             let hint = Hint::new(&record, size - record.value().len());
             index.insert(record.key().to_string(), hint);
+        }
+
+        let mut indexies = segments.iter().map(|i| &i.0).collect::<Vec<&usize>>();
+        indexies.sort();
+
+        let mut lock = self.segments.try_write()?;
+        for index in indexies.iter().rev() {
+            lock.remove(**index);
+        }
+        drop(lock);
+
+        for reader in segments.iter_mut() {
+            reader.1.complete();
         }
 
         // When segment readers drop, we delete the files they we're reading.
@@ -193,40 +226,38 @@ impl Levels {
         })
     }
 
-    pub fn insert(&self, sstable: SSTable) {
-        self.inner.write().unwrap()[0].add(Storage::SSTable(sstable));
-        let inner = self.inner.clone();
-        let directory = self.directory.clone();
-        std::thread::spawn(move || {
-            let directory = directory.read().unwrap();
-            let mut index = 0;
-            let mut level_index = 2;
-            let mut next_path = (&directory).join(format!("lv{}", level_index));
-            if !next_path.exists() {
-                std::fs::create_dir(&next_path).unwrap();
+    pub fn try_merge(&self) {
+        let directory = (self.directory.read().unwrap()).clone();
+        let mut index = 0;
+        let mut level_index = 2;
+        let mut next_path = (&directory).join(format!("lv{}", level_index));
+        if !next_path.exists() {
+            std::fs::create_dir(&next_path).unwrap();
+        }
+        let mut new_segment_file = self.inner.read().unwrap()[0]
+            .save_sstables(&next_path)
+            .unwrap();
+        loop {
+            if new_segment_file.is_none() {
+                return;
             }
-            let mut new_segment_file = inner.write().unwrap()[0].save_sstables(&next_path).unwrap();
-            loop {
-                if new_segment_file.is_none() {
-                    return;
+            let level = match self.inner.read().unwrap().get(index) {
+                Some(level) => level.clone(),
+                None => {
+                    let level = Level::new(&*directory, level_index).unwrap();
+                    self.inner.write().unwrap().push(level.clone());
+                    level
                 }
-                let mut inner = inner.read().unwrap();
-                let level = match inner.get(index) {
-                    Some(level) => level,
-                    None => {
-                        let level = Level::new(&*directory, level_index).unwrap();
-                        inner.push(level);
-                        inner.get(index).unwrap()
-                    }
-                };
-                level_index += 1;
-                index += 1;
+            };
+            level_index += 1;
+            index += 1;
 
-                next_path = (&*directory).join(format!("lv{}", level_index));
-                level.add(Storage::Segment(new_segment_file.take().unwrap()));
-                new_segment_file = level.save_sstables(next_path).unwrap();
-            }
-        });
+            next_path = (&*directory).join(format!("lv{}", level_index));
+            level
+                .add(Storage::Segment(new_segment_file.take().unwrap()))
+                .unwrap();
+            new_segment_file = level.save_sstables(next_path).unwrap();
+        }
     }
 
     pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
@@ -237,6 +268,11 @@ impl Levels {
             }
         }
         Ok(None)
+    }
+
+    pub fn add_table(&self, sstable: SSTable) -> crate::Result<()> {
+        self.inner.write().unwrap()[0].add(Storage::SSTable(sstable))?;
+        Ok(())
     }
 }
 
@@ -252,21 +288,28 @@ impl KvStore {
     fn write(&self, key: String, value: Option<String>) -> crate::Result<()> {
         let new_size = self.sstable.read().unwrap().append(key, value)?;
 
-        if new_size > 256 * 1000 * 1000 {
+        if new_size > 128
+        /*  * 1000 * 1000 */
+        {
             // sstable is too large, rotate
-            let sstable = self.sstable.write().unwrap();
-            let old_sstable = sstable.clone();
-            *sstable = SSTable::new(*self.directory.read().unwrap())?;
+            let directory = &*self.directory.read().unwrap();
+            let new_sstable = SSTable::new(directory)?;
+            let mut sstable = self.sstable.write().unwrap();
+            let old_sstable = std::mem::replace(&mut *sstable, new_sstable);
             drop(sstable);
-            self.levels.insert(old_sstable);
+            self.levels.add_table(old_sstable)?;
+            let levels = self.levels.clone();
+            std::thread::spawn(move || levels.try_merge());
         }
         Ok(())
     }
 
+    /// Add a value to our key value store
     pub fn add(&self, key: String, value: String) -> crate::Result<()> {
         self.write(key, Some(value))
     }
 
+    /// remove a value from our key value store
     pub fn remove(&self, key: String) -> crate::Result<()> {
         self.write(key, None)
     }
@@ -290,8 +333,24 @@ impl KvsEngine for KvStore {
             }
         }
 
+        let dir = std::fs::read_dir(&directory)?;
+        let mut redo_log_path = None;
+        for entry in dir {
+            let entry = entry?;
+            if let Some(s) = entry.path().extension() {
+                if s == "redo" {
+                    trace!("Found redo log: {:?}", entry.path());
+                    redo_log_path = Some(PathBuf::from(entry.path()));
+                    break;
+                }
+            }
+        }
+
         let levels = Levels::new(directory.as_path())?;
-        let sstable = SSTable::new(&directory)?;
+        let sstable = match redo_log_path {
+            Some(file) => SSTable::from_write_ahead_log(&file),
+            None => SSTable::new(&directory),
+        }?;
 
         info!("State read, application ready for requests");
         Ok(Self {

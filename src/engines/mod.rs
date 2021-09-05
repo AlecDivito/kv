@@ -40,12 +40,11 @@ mod sstable;
 
 /// kvs is this libraries implementation of a key value store
 // pub mod kvs;
-pub mod kvs2;
-
+// pub mod kvs2;
 pub mod kvs3;
 
 /// sled is a already implemented library in rust
 pub mod sled;
 
-pub use self::kvs2::KvStore;
+pub use self::kvs3::KvStore;
 pub use self::sled::SledKvsEngine;
