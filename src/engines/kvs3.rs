@@ -1,8 +1,7 @@
 use std::{
     collections::HashMap,
-    convert::TryInto,
     fs::File,
-    io::{BufRead, BufReader, BufWriter, Read, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
@@ -37,37 +36,37 @@ impl Storage {
 
 struct Level {
     level: Pin<Box<usize>>,
-    directory: Pin<Box<PathBuf>>,
-    segments: Pin<Box<[Option<Storage>; 5]>>,
-    index: Pin<Box<usize>>,
+    directory: Pin<PathBuf>,
+    segments: Pin<Box<Vec<Storage>>>,
+    index: Pin<usize>,
 }
 
 impl Level {
     pub fn new(directory: impl Into<PathBuf>, level: usize) -> crate::Result<Self> {
         let directory = directory.into();
-        let reader = BufReader::new(File::open((&directory).join("order"))?);
-        let segments = [None; 5];
-        let mut line = String::new();
-        let mut index = 0;
-        loop {
-            let size = reader.read_line(&mut line)?;
-            if size == 0 {
-                break;
+
+        let dirs = std::fs::read_dir(&directory)?;
+        let mut log_paths = vec![];
+        for entry in dirs {
+            let entry = entry?;
+            if entry.path().is_dir() {
+                continue;
             }
-            if index >= 5 {
-                // TODO: instead of failing here, we may want to just compact our
-                // files...
-                return Err(KvError::Parse("To many level files found".into()));
+            if !entry.path().ends_with("log") {
+                continue;
             }
-            segments[index] = Some(Storage::Segment(Segment::from_log(
-                (&directory).join(line),
-            )?));
+            log_paths.push(entry.path());
         }
+
+        let mut segments = vec![];
+        for path in log_paths {
+            segments.push(Storage::Segment(Segment::from_log(path)?));
+        }
+
         Ok(Self {
+            directory: Pin::new(directory),
             level: Pin::new(Box::new(level)),
-            directory: Pin::new(Box::new(directory)),
             segments: Pin::new(Box::new(segments)),
-            index: Pin::new(Box::new(index)),
         })
     }
 
@@ -170,6 +169,7 @@ impl Level {
 #[derive(Clone)]
 struct Levels {
     inner: Arc<RwLock<Vec<Level>>>,
+    directory: Pin<Box<PathBuf>>,
 }
 
 impl Levels {
@@ -188,20 +188,37 @@ impl Levels {
 
         Ok(Self {
             inner: Arc::new(RwLock::new(levels)),
+            directory: Pin::new(Box::new(directory)),
         })
     }
 
     pub fn insert(&self, sstable: SSTable) {
         let inner = self.inner.clone();
+        let directory = self.directory;
         std::thread::spawn(move || {
             // the first level always exists
             let mut index = 0;
             let mut storage = Storage::SSTable(sstable);
             loop {
-                let inner = // TODO: plz
-                let next = 
-                if let Some(segment) = inner.read().unwrap().get(index).unwrap().insert(storage) {
-                    storage = segment;
+                let next = index + 1;
+                let level = match inner.read().unwrap().get(index) {
+                    Some(level) => level,
+                    None => {
+                        let level = Level::new(*directory, next).unwrap();
+                        inner.write().unwrap().push(level);
+                        inner.read().unwrap().get(index).unwrap()
+                    }
+                };
+                let next_path = (&*directory).join(format!("lv{}", next));
+                if let Some(segment) = inner
+                    .read()
+                    .unwrap()
+                    .get(index)
+                    .unwrap()
+                    .insert(storage, next_path)
+                    .unwrap()
+                {
+                    storage = Storage::Segment(segment);
                 } else {
                     break;
                 }
