@@ -159,10 +159,11 @@ impl MemoryTable {
     }
 
     fn drain_to_segment(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
+        let path = path.into();
         let mut index = HashMap::new();
-        let writer = BufWriter::new(File::create(&path.into())?);
+        let mut writer = BufWriter::new(File::create(&path)?);
+        let mut file_size = 0;
         let table = self.inner.read().unwrap();
-        let file_size = 0;
         for (key, value) in table.iter() {
             let record = Record::new(key.clone(), value.clone());
             let bytes = bincode::serialize(&record)?;
@@ -172,7 +173,7 @@ impl MemoryTable {
         }
         drop(table);
         self.inner.write().unwrap().clear();
-        Ok(Segment::new(index, path, file_size))
+        Ok(Segment::new(index, &path, file_size))
     }
 }
 
@@ -226,9 +227,9 @@ impl SSTable {
         self.inner.get(key)
     }
 
-    /// Rotate the SSTable from memory onto disk as segment file. Return the path
+    /// Save the SSTable from memory onto disk as segment file. Return the path
     /// to the new segment file.
-    pub fn rotate(&self, segment_path: impl Into<PathBuf>) -> crate::Result<Segment> {
+    pub fn save(&self, segment_path: impl Into<PathBuf>) -> crate::Result<Segment> {
         self.inner.drain_to_segment(segment_path)
     }
 
@@ -283,38 +284,36 @@ impl Segment {
             Some(hint) => hint,
             None => return Ok(None),
         };
-        let mut reader = BufReader::new(File::open(*self.segment_path)?);
+        let mut reader = BufReader::new(File::open(&*self.segment_path)?);
         let mut value = vec![0u8; hint.value_size];
         debug!("Reading {} from {:?}", key, self.segment_path);
         reader.seek(SeekFrom::Start(hint.value_position as u64))?;
         reader.read(&mut value)?;
         Ok(Some(String::from_utf8(value).unwrap()))
     }
-
-    pub fn open(&self) -> crate::Result<BufReader<File>> {
-        Ok(BufReader::new(File::open(*self.segment_path)?))
-    }
 }
 
 pub struct SegmentReader {
+    path: PathBuf,
     reader: BufReader<File>,
     value: Option<Record>,
 }
 
 impl SegmentReader {
     pub fn new(segment: &Segment) -> crate::Result<Self> {
-        let reader = segment.open()?;
-        let mut segment_reader = Self {
+        let path = (*segment.segment_path).clone();
+        let reader = BufReader::new(File::open(&path)?);
+        Ok(Self {
+            path,
             reader,
             value: None,
-        };
-        Ok(segment_reader)
+        })
     }
 
     pub fn next(&mut self) -> crate::Result<()> {
         if self.value.is_none() {
             if !self.done() {
-                self.value = Some(bincode::deserialize_from(self.reader)?)
+                self.value = Some(bincode::deserialize_from(&mut self.reader)?)
             }
         }
         Ok(())
@@ -330,5 +329,11 @@ impl SegmentReader {
 
     pub fn done(&mut self) -> bool {
         self.reader.fill_buf().unwrap().len() == 0 && self.value.is_none()
+    }
+}
+
+impl Drop for SegmentReader {
+    fn drop(&mut self) {
+        todo!()
     }
 }
