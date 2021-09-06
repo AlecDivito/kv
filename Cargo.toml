@@ -25,6 +25,7 @@ env_logger = "0.9"
 sled = "0.34.6"
 crc = "2.0.0"
 uuid = { version = "0.8", features = ["v4"]}
+bit-vec = "0.6.3"
 
 [dev-dependencies]
 assert_cmd = "2.0"
