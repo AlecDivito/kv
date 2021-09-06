@@ -1,16 +1,13 @@
 use std::{
-    collections::HashMap,
     ffi::OsStr,
-    fs::File,
-    io::{BufWriter, Write},
     path::PathBuf,
     pin::Pin,
     sync::{Arc, RwLock},
 };
 
-use crate::{common::now, engines::sstable::Hint, KvError, KvsEngine};
+use crate::{common::now, KvError, KvsEngine};
 
-use super::sstable::{Record, SSTable, Segment, SegmentReader};
+use super::sstable::{SSTable, Segment, SegmentReader};
 
 #[derive(Debug)]
 pub enum Storage {
@@ -155,96 +152,37 @@ impl Level {
 
     fn merge(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
         let segment_path = path.into().join(format!("{}.log", now()));
-        info!("Merging level {} into {:?}", self.level, &segment_path);
+        // get all of the relavent segments
         let segments_lock = self.segments.read().unwrap();
-        let mut segments = segments_lock
+        let storage_segments = segments_lock
             .iter()
             .enumerate()
             .filter(|(_, s)| s.segment().is_some())
-            .map(|(index, s)| (index, SegmentReader::new(s.segment().unwrap())))
-            .filter(|(_, reader)| reader.is_ok())
-            .map(|(index, reader)| (index, reader.unwrap()))
-            .collect::<Vec<(usize, SegmentReader)>>();
-        trace!(
-            "Of {} segments, found {} which are readable",
-            segments_lock.len(),
-            segments.len()
-        );
+            .collect::<Vec<(usize, &Storage)>>();
+        // partition the segments and indexies
+        let segment_readers: Vec<SegmentReader> = storage_segments
+            .iter()
+            .filter_map(|(_, s)| s.segment())
+            .filter_map(|s| SegmentReader::new(s).ok())
+            .collect();
+        let mut indexies = storage_segments.iter().map(|i| i.0).collect::<Vec<usize>>();
+        indexies.sort();
         drop(segments_lock);
 
-        let mut index = HashMap::new();
-        let mut size = 0;
-        let mut writer = BufWriter::new(File::create(&segment_path)?);
-        loop {
-            for reader in segments.iter_mut() {
-                reader.1.next()?;
-            }
+        // attempt the merging processes
+        let segment = Segment::from_segments(segment_path, segment_readers)?;
 
-            // 1. Find the keys with the lowest
-            // remember that files do not have dulicates
-            let mut records = segments
-                .iter_mut()
-                .filter(|f| f.1.value.is_some())
-                .map(|f| &mut f.1.value)
-                .collect::<Vec<&mut Option<Record>>>();
-            records.sort_by_key(|f| f.as_ref().unwrap().key().to_string());
-            records.reverse();
-
-            // 2. If records is empty, then we've merged all the files
-            if records.is_empty() {
-                trace!("Records is empty. All files have successfully been compacted");
-                break;
-            }
-
-            // 3. Pop the first value from the record
-            let lowest = records.pop().unwrap().take().unwrap();
-            trace!("Lowest record found was {}", lowest);
-            let mut next_records = vec![lowest];
-            for record in records {
-                if record.as_ref().unwrap().key() == next_records[0].key() {
-                    let r = record.take().unwrap();
-                    trace!("Found same record: {}", r);
-                    next_records.push(r);
-                }
-            }
-
-            // 4. sort the next records by timestamp, save the one with the highest timestamp
-            next_records.sort_by_key(|f| f.timestamp());
-            let record = next_records.pop().unwrap();
-            trace!("Appending {} to {:?}", record, &segment_path);
-
-            // 5. write the value
-            let bytes = bincode::serialize(&record)?;
-            size += writer.write(&bytes)?;
-            let hint = Hint::new(&record, size - record.value().len());
-            index.insert(record.key().to_string(), hint);
-        }
-
-        let mut indexies = segments.iter().map(|i| &i.0).collect::<Vec<&usize>>();
-        trace!(
-            "Level {}: Removing old indices from segments {:?}",
-            self.level,
-            indexies
-        );
-        indexies.sort();
-
+        // on successful compaction, remove the segments touched
         let mut lock = self.segments.write().unwrap();
         for index in indexies.iter().rev() {
-            trace!(
-                "Level {}: Removing segment {}",
-                self.level,
-                lock.get(**index).unwrap()
-            );
-            lock.remove(**index);
+            if let Storage::Segment(segment) = lock.get_mut(*index).unwrap() {
+                segment.mark_for_removal();
+                lock.remove(*index);
+            }
         }
         drop(lock);
 
-        for reader in segments.iter_mut() {
-            reader.1.complete();
-        }
-
-        // When segment readers drop, we delete the files they we're reading.
-        Ok(Segment::new(index, segment_path, size))
+        Ok(segment)
     }
 }
 
@@ -412,6 +350,9 @@ impl KvsEngine for KvStore {
             if let Some(s) = entry.path().extension() {
                 if s == "redo" {
                     trace!("Found redo log: {:?}", entry.path());
+                    // TODO: If we find multiple redo logs on startup, we should
+                    // just compress them right now. At least we should include
+                    // an option for the user to submit.
                     redo_log_path = Some(PathBuf::from(entry.path()));
                     break;
                 }

@@ -1,7 +1,6 @@
 use bit_vec::BitVec;
 use std::collections::hash_map::{DefaultHasher, RandomState};
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::marker::PhantomData;
 
 /// A BloomFilter is a space effeint way to store the likely hood a given value
 /// is contained inside of a set. A Bloom filter is good for telling you if a
@@ -19,7 +18,7 @@ use std::marker::PhantomData;
 ///
 /// The probability that `contains` returns `true` for an item that is not
 /// present in the filter is called the False Positive Rate.
-pub struct BloomFilter<T: ?Sized> {
+pub struct BloomFilter {
     bitmap: BitVec,
     /// Size of the bit array.
     optimal_m: usize,
@@ -27,10 +26,9 @@ pub struct BloomFilter<T: ?Sized> {
     optimal_k: u32,
     /// Two hash functions from which k number of hashes are derived.
     hashers: [DefaultHasher; 2],
-    _marker: PhantomData<T>,
 }
 
-impl<T: ?Sized> BloomFilter<T> {
+impl BloomFilter {
     /// Create a new StandardBloomFilter that expects to store `items_count`
     /// membership with a false positive rate of the value specified in `fp_rate`.
     pub fn new(items_count: usize, fp_rate: f64) -> Self {
@@ -45,15 +43,11 @@ impl<T: ?Sized> BloomFilter<T> {
             optimal_m,
             optimal_k,
             hashers,
-            _marker: PhantomData,
         }
     }
 
     /// Insert item to the set.
-    pub fn insert(&mut self, item: &T)
-    where
-        T: Hash,
-    {
+    pub fn insert(&mut self, item: &str) {
         let (h1, h2) = self.hash_kernel(item);
 
         for k_i in 0..self.optimal_k {
@@ -65,10 +59,7 @@ impl<T: ?Sized> BloomFilter<T> {
 
     /// Check if an item is present in the set.
     /// There can be false positives, but no false negatives.
-    pub fn contains(&self, item: &T) -> bool
-    where
-        T: Hash,
-    {
+    pub fn contains(&self, item: &str) -> bool {
         let (h1, h2) = self.hash_kernel(item);
 
         for k_i in 0..self.optimal_k {
@@ -103,10 +94,7 @@ impl<T: ?Sized> BloomFilter<T> {
     }
 
     /// Calculate two hash values from which the k hashes are derived.
-    fn hash_kernel(&self, item: &T) -> (u64, u64)
-    where
-        T: Hash,
-    {
+    fn hash_kernel(&self, item: &str) -> (u64, u64) {
         let hasher1 = &mut self.hashers[0].clone();
         let hasher2 = &mut self.hashers[1].clone();
 

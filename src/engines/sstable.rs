@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt::Debug,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -14,35 +14,6 @@ use uuid::Uuid;
 
 use crate::common::now;
 use crate::datastructures::bloom::BloomFilter;
-
-#[derive(Clone, Default, Deserialize, Serialize, Debug)]
-pub struct Hint {
-    timestamp: u128,
-    value_size: usize,
-    value_position: usize,
-    key: String,
-}
-
-impl Hint {
-    pub fn new(record: &Record, value_position: usize) -> Self {
-        Self {
-            timestamp: record.timestamp,
-            value_size: record.value().len(),
-            value_position,
-            key: record.key.clone(),
-        }
-    }
-}
-
-impl std::fmt::Display for Hint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Hint({}): ({}, {}, {})",
-            self.key, self.timestamp, self.value_position, self.value_size
-        )
-    }
-}
 
 #[derive(Default, Deserialize, Serialize, Debug)]
 pub struct Record {
@@ -85,10 +56,6 @@ impl Record {
 
     pub fn value(&self) -> String {
         self.value.clone().unwrap_or("".to_string())
-    }
-
-    pub(crate) fn timestamp(&self) -> u128 {
-        self.timestamp
     }
 }
 
@@ -165,23 +132,26 @@ impl MemoryTable {
     }
 
     fn drain_to_segment(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
-        let path = path.into();
-        debug!("Draining memory table to segment {:?}", path);
-        let mut index = HashMap::new();
-        let mut writer = BufWriter::new(File::create(&path)?);
-        let mut file_size = 0;
+        let segment_path = path.into();
+        debug!("Draining memory table to segment {:?}", segment_path);
+
         let table = self.inner.read().unwrap();
+        let element_length = table.len();
+        let mut writer = BufWriter::new(File::create(&segment_path)?);
+        let mut size = writer.write(&element_length.to_be_bytes())?;
+
+        let mut index = Index::new(element_length);
+        let mut block_start = size;
         for (key, value) in table.iter() {
             let record = Record::new(key.clone(), value.clone());
-            let bytes = bincode::serialize(&record)?;
-            file_size += writer.write(&bytes)?;
-            let hint = Hint::new(&record, file_size - record.value().len());
-            trace!("Wrote {} to segment, added {} to index", record, hint);
-            index.insert(record.key, hint);
+            let mut bytes = bincode::serialize(&record)?;
+            block_start += index.add(block_start, record)?;
+            size += writer.write(&mut bytes)?;
         }
+
         drop(table);
         self.inner.write().unwrap().clear();
-        Ok(Segment::new(index, &path, file_size))
+        Ok(Segment::new(index, &segment_path, size))
     }
 }
 
@@ -277,114 +247,298 @@ impl Drop for SSTable {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct BlockHint {
     key: String,
     number_of_elements: usize,
-    block_size: usize,
+    block_size: u64,
     block_start: u64,
 }
 
+pub enum Compare {
+    Equal,
+    Higher,
+    Lower,
+}
+
 impl BlockHint {
-    pub fn new(
-        writer: &mut BufWriter<File>,
-        records: Vec<Record>,
-        key: String,
-    ) -> crate::Result<Self> {
-        let number_of_elements = records.len();
-        let block_start = writer.seek(SeekFrom::Current(0))?;
-        let mut block_size = 0;
-        for record in records {
-            let bytes = bincode::serialize(&record)?;
-            block_size = block_size + bytes.len();
-            writer.write(&bytes)?;
-        }
-        Ok(Self {
-            key,
-            number_of_elements,
-            block_size,
+    pub fn new(block_start: u64) -> Self {
+        Self {
+            key: String::new(),
+            number_of_elements: 0,
+            block_size: 0,
             block_start,
-        })
+        }
+    }
+
+    fn init_block(&mut self, record: Record, record_size: u64) {
+        self.key = record.key().to_string();
+        self.block_size = record_size;
+        self.number_of_elements = 1;
+    }
+
+    pub fn add(&mut self, record: Record) -> crate::Result<(u64, Option<BlockHint>)> {
+        let record_size = bincode::serialized_size(&record)?;
+        let mut next_block = None;
+        if self.block_size == 0 {
+            // Adding the first block
+            self.init_block(record, record_size);
+        } else {
+            let new_block_size = self.block_size + record_size;
+            if new_block_size - self.block_start > 4096 {
+                // create a new block
+                let mut new_block = BlockHint::new(self.block_start + self.block_size);
+                new_block.init_block(record, record_size);
+                next_block = Some(new_block);
+            } else {
+                // add to the current block
+                self.number_of_elements += 1;
+                self.block_size = new_block_size;
+            }
+        }
+        Ok((record_size, next_block))
+    }
+
+    pub fn compare(&self, key: &str) -> Compare {
+        if self.key == key {
+            Compare::Equal
+        } else if self.key.as_str() < key {
+            Compare::Higher
+        } else {
+            Compare::Lower
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.key.len()
+            + self.number_of_elements.to_be_bytes().len()
+            + self.block_size.to_be_bytes().len()
+            + self.block_start.to_be_bytes().len()
+    }
+
+    pub(crate) fn search_for(
+        &self,
+        segment_path: &Pin<PathBuf>,
+        key: &str,
+    ) -> crate::Result<Option<String>> {
+        let mut reader = BufReader::new(File::open(segment_path.to_path_buf())?);
+        reader.seek(SeekFrom::Start(self.block_start))?;
+
+        let mut counter = 0;
+        while counter <= self.number_of_elements {
+            if reader.fill_buf().unwrap().len() == 0 {
+                return Ok(None);
+            }
+            counter += 1;
+            let record: Record = bincode::deserialize_from(&mut reader)?;
+            if record.key == key {
+                return Ok(record.value);
+            }
+        }
+        Ok(None)
     }
 }
 
 pub struct Index {
-    filter: Pin<Box<BloomFilter<String>>>,
-    hints: Pin<Box<Vec<BlockHint>>>,
+    filter: BloomFilter,
+    hints: Vec<BlockHint>,
+    element_size: usize,
+    byte_size: u64,
 }
 
-#[derive(Clone)]
+impl Index {
+    pub fn new(estimated_elements: usize) -> Self {
+        let filter = BloomFilter::new(estimated_elements, 0.001);
+        Self {
+            filter,
+            hints: Vec::new(),
+            element_size: 0,
+            byte_size: 0,
+        }
+    }
+
+    pub fn add(&mut self, block_start: usize, record: Record) -> crate::Result<usize> {
+        if record.crc != record.calculate_crc() {
+            let actual_crc = record.calculate_crc();
+            error!("{} is corrupt (Actual {})", record, actual_crc);
+            return Ok(bincode::serialized_size(&record)? as usize);
+        }
+        self.filter.insert(record.key());
+        let block = match self.hints.last_mut() {
+            Some(block) => block,
+            None => {
+                let block = BlockHint::new(block_start as u64);
+                self.hints.push(block);
+                self.hints.last_mut().unwrap()
+            }
+        };
+        let (record_size, new_block) = block.add(record)?;
+        self.byte_size += record_size;
+        if let Some(block) = new_block {
+            self.hints.push(block);
+        }
+        Ok(record_size as usize)
+    }
+
+    pub fn get(&self, key: &str) -> Option<&BlockHint> {
+        if !self.filter.contains(key) {
+            None
+        } else {
+            Some(self.search(key))
+        }
+    }
+
+    fn search(&self, key: &str) -> &BlockHint {
+        let mut middle = self.hints.len() / 2;
+        let mut hints = &self.hints[..];
+        loop {
+            if hints.len() == 1 {
+                return &hints[0];
+            }
+            match hints[middle].compare(key) {
+                Compare::Higher => {
+                    hints = &hints[middle..self.hints.len()];
+                    middle = middle / 2;
+                }
+                Compare::Lower => {
+                    hints = &hints[0..middle];
+                    middle = middle / 2;
+                }
+                Compare::Equal => return &hints[middle],
+            }
+        }
+    }
+}
+
+impl Debug for Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Index")
+            .field("hints", &self.hints)
+            .field("element_size", &self.element_size)
+            .field("byte_size", &self.byte_size)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for Index {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let index_size = self.hints.iter().fold(0, |o, h| o + h.size());
+        write!(
+            f,
+            "Index(data size: {}, index size: {}, element size: {})",
+            self.byte_size, index_size, self.element_size
+        )
+    }
+}
 /// An index that maps records in a file a log file keys  
 pub struct Segment {
-    index: Index,
+    index: Pin<Box<Index>>,
     segment_path: Pin<PathBuf>,
     size: Pin<Box<usize>>,
+    should_remove: Pin<Box<bool>>,
 }
 
 impl Segment {
-    pub fn new(
-        index: HashMap<String, Hint>,
-        segment_path: impl Into<PathBuf>,
-        size: usize,
-    ) -> Self {
+    pub fn new(index: Index, segment_path: impl Into<PathBuf>, size: usize) -> Self {
         let path = segment_path.into();
-
-        let mut bloom_filter = BloomFilter::new(index.len(), 0.008);
-        for key in index.keys() {
-            bloom_filter.insert(key);
-        }
-
-        debug!("Create new Segment with {} items {:?}", index.len(), &path);
+        debug!("Create new Segment with {} items {:?}", index, &path);
         Self {
-            bloom_filter: Arc::new(RwLock::new(bloom_filter)),
             index: Pin::new(Box::new(index)),
             segment_path: Pin::new(path),
             size: Pin::new(Box::new(size)),
+            should_remove: Pin::new(Box::new(false)),
         }
     }
 
     pub fn from_log(path: impl Into<PathBuf>) -> crate::Result<Segment> {
         let segment_path = path.into();
         debug!("Reading segment from log: {:?}", &segment_path);
-        let mut size = 0;
-        let mut index = HashMap::new();
         let mut reader = BufReader::new(File::open(&segment_path)?);
+        let mut size_buffer = (0 as usize).to_be_bytes();
+        let mut block_start = reader.read(&mut size_buffer)?;
+        let elements = usize::from_be_bytes(size_buffer);
+
+        let mut index = Index::new(elements);
         while reader.fill_buf().unwrap().len() != 0 {
             let record: Record = bincode::deserialize_from(&mut reader).unwrap();
-            size += bincode::serialized_size(&record)? as usize;
-            if record.crc != record.calculate_crc() {
-                let actual_crc = record.calculate_crc();
-                trace!("{} is corrupt (Actual {})", record, actual_crc);
-                continue;
-            }
-            let hint = Hint::new(&record, size - record.value().len());
-            trace!("Read record {}, adding {} to hashmap", &record, &hint);
-            index.insert(record.key, hint);
+            block_start += index.add(block_start, record)?;
         }
-        Ok(Self::new(index, segment_path, size))
+        Ok(Self::new(index, segment_path, block_start))
+    }
+
+    pub fn from_segments(
+        path: impl Into<PathBuf>,
+        mut readers: Vec<SegmentReader>,
+    ) -> crate::Result<Segment> {
+        // initialize variables
+        let segment_path = path.into();
+        let estimated_elements = readers.iter().fold(0, |o, r| o + r.elements);
+        let start: usize = 0;
+        let mut writer = BufWriter::new(File::create(&segment_path)?);
+        let mut block_start = writer.write(&start.to_be_bytes())?;
+        let mut index = Index::new(estimated_elements);
+        let mut size = 0;
+        let mut count: usize = 0;
+
+        loop {
+            // read the next record inside of the segment file
+            for reader in readers.iter_mut() {
+                reader.next()?;
+            }
+
+            // get all of the values from the readers
+            let mut records: Vec<&mut Option<Record>> = readers
+                .iter_mut()
+                .map(|r| &mut r.value)
+                .filter(|r| r.is_some())
+                .collect();
+
+            // however, if there was no records left, then leave the loop
+            if records.is_empty() {
+                break;
+            }
+
+            // sort by key so we have an ordered list from largest to smallest
+            records.sort_by_key(|f| f.as_ref().unwrap().key().to_string());
+            records.reverse();
+
+            // remove the first value and take all of the other keys that are equal to it
+            let mut groupped_records = vec![records.pop().unwrap().take().unwrap()];
+            for record in records {
+                if record.as_ref().unwrap().key == groupped_records[0].key {
+                    groupped_records.push(record.take().unwrap());
+                }
+            }
+
+            // again, sort by timestamp, take the newest one (highest timestamp)
+            groupped_records.sort_by_key(|r| r.timestamp);
+            let writeable_record = groupped_records.pop().unwrap();
+
+            // write the record to our database
+            let mut bytes = bincode::serialize(&writeable_record)?;
+            block_start += index.add(block_start, writeable_record)?;
+            size += writer.write(&mut bytes)?;
+            count += 1;
+        }
+
+        // rewrite first 8 bytes to have the correct count of elements in the file
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write(&count.to_be_bytes())?;
+
+        Ok(Segment::new(index, segment_path, size))
     }
 
     pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
         debug!("Searching for {} in {:?}", key, self.segment_path);
-        if !self
-            .bloom_filter
-            .try_read()
-            .unwrap()
-            .contains(&key.to_string())
-        {
-            return Ok(None);
+        if let Some(block_hint) = self.index.get(key) {
+            Ok(block_hint.search_for(&self.segment_path, key)?)
+        } else {
+            Ok(None)
         }
-        let hint = match self.index.get(key) {
-            Some(hint) => hint,
-            None => {
-                trace!("Key {} not found in {:?}", key, self.segment_path);
-                return Ok(None);
-            }
-        };
-        let mut reader = BufReader::new(File::open(&*self.segment_path)?);
-        let mut value = vec![0u8; hint.value_size];
-        reader.seek(SeekFrom::Start(hint.value_position as u64))?;
-        reader.read(&mut value)?;
-        Ok(Some(String::from_utf8(value).unwrap()))
+    }
+
+    pub fn mark_for_removal(&mut self) {
+        *self.should_remove = true;
     }
 }
 
@@ -392,10 +546,8 @@ impl std::fmt::Display for Segment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Segment({} bytes, {} indicies -> {:?}) ",
-            self.size,
-            self.index.len(),
-            self.segment_path
+            "Segment({} bytes, {} -> {:?}) ",
+            self.size, self.index, self.segment_path
         )
     }
 }
@@ -412,14 +564,24 @@ impl Debug for Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        debug!("Dropped {}", self);
+        if *self.should_remove {
+            trace!("Dropping segment {:?}. Deleting file.", &self.segment_path);
+            if self.segment_path.exists() {
+                std::fs::remove_file(&*self.segment_path).unwrap();
+            } else {
+                error!(
+                    "Failed to delete segment {:?} as the file no longer exists",
+                    self.segment_path
+                );
+            }
+        }
     }
 }
 
 pub struct SegmentReader {
     path: PathBuf,
     reader: BufReader<File>,
-    complete: bool,
+    elements: usize,
     pub value: Option<Record>,
 }
 
@@ -427,12 +589,15 @@ impl SegmentReader {
     pub fn new(segment: &Segment) -> crate::Result<Self> {
         trace!("Creating segment reader from {}", segment);
         let path = PathBuf::from(&*segment.segment_path.clone());
-        let reader = BufReader::new(File::open(&path)?);
+        let mut reader = BufReader::new(File::open(&path)?);
+        let mut size_buffer = (0 as usize).to_be_bytes();
+        reader.read(&mut size_buffer)?;
+        let elements = usize::from_be_bytes(size_buffer);
         Ok(Self {
             path,
             reader,
+            elements,
             value: None,
-            complete: false,
         })
     }
 
@@ -449,18 +614,5 @@ impl SegmentReader {
 
     pub fn done(&mut self) -> bool {
         self.reader.fill_buf().unwrap().len() == 0 && self.value.is_none()
-    }
-
-    pub fn complete(&mut self) {
-        self.complete = true;
-    }
-}
-
-impl Drop for SegmentReader {
-    fn drop(&mut self) {
-        if self.complete && self.path.exists() {
-            trace!("Dropping segment reader {:?}. Deleting file.", &self.path);
-            std::fs::remove_file(&self.path).unwrap();
-        }
     }
 }
