@@ -39,7 +39,7 @@ impl<E: KvsEngine> KvServer<E> {
     }
 
     fn serve(&mut self, tcp: TcpStream) -> Result<()> {
-        let peer_addr = tcp.peer_addr()?;
+        // let peer_addr = tcp.peer_addr()?;
         let reader = BufReader::new(&tcp);
         let mut writer = BufWriter::new(&tcp);
         let req_reader = Deserializer::from_reader(reader).into_iter::<Request>();
