@@ -38,9 +38,7 @@ impl std::fmt::Display for Engine {
 }
 
 fn main() {
-    env_logger::builder()
-        .filter_level(LevelFilter::Debug)
-        .init();
+    env_logger::builder().filter_level(LevelFilter::Info).init();
     let opt = App::new("kvs-server")
         .version("1.0.0")
         .author("Alec Di Vito")

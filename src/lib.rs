@@ -12,6 +12,7 @@ pub use server::KvServer;
 
 mod client;
 mod common;
+mod datastructures;
 mod engines;
 mod error;
 mod server;

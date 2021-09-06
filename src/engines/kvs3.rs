@@ -356,9 +356,7 @@ impl KvStore {
     fn write(&self, key: String, value: Option<String>) -> crate::Result<()> {
         let new_size = self.sstable.read().unwrap().append(key, value)?;
 
-        if new_size > 1048
-        /*  * 1000 * 1000 */
-        {
+        if new_size > 256 * 1000 * 1000 {
             // sstable is too large, rotate
             let directory = &*self.directory.read().unwrap();
             let new_sstable = SSTable::new(directory)?;

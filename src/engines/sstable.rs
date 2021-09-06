@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    fmt::Debug,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::PathBuf,
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::common::now;
+use crate::datastructures::bloom::BloomFilter;
 
 #[derive(Clone, Default, Deserialize, Serialize, Debug)]
 pub struct Hint {
@@ -275,11 +277,46 @@ impl Drop for SSTable {
     }
 }
 
-#[derive(Clone, Debug)]
+pub struct BlockHint {
+    key: String,
+    number_of_elements: usize,
+    block_size: usize,
+    block_start: u64,
+}
+
+impl BlockHint {
+    pub fn new(
+        writer: &mut BufWriter<File>,
+        records: Vec<Record>,
+        key: String,
+    ) -> crate::Result<Self> {
+        let number_of_elements = records.len();
+        let block_start = writer.seek(SeekFrom::Current(0))?;
+        let mut block_size = 0;
+        for record in records {
+            let bytes = bincode::serialize(&record)?;
+            block_size = block_size + bytes.len();
+            writer.write(&bytes)?;
+        }
+        Ok(Self {
+            key,
+            number_of_elements,
+            block_size,
+            block_start,
+        })
+    }
+}
+
+pub struct Index {
+    filter: Pin<Box<BloomFilter<String>>>,
+    hints: Pin<Box<Vec<BlockHint>>>,
+}
+
+#[derive(Clone)]
 /// An index that maps records in a file a log file keys  
 pub struct Segment {
-    index: Pin<Box<HashMap<String, Hint>>>,
-    segment_path: Pin<Box<PathBuf>>,
+    index: Index,
+    segment_path: Pin<PathBuf>,
     size: Pin<Box<usize>>,
 }
 
@@ -290,10 +327,17 @@ impl Segment {
         size: usize,
     ) -> Self {
         let path = segment_path.into();
+
+        let mut bloom_filter = BloomFilter::new(index.len(), 0.008);
+        for key in index.keys() {
+            bloom_filter.insert(key);
+        }
+
         debug!("Create new Segment with {} items {:?}", index.len(), &path);
         Self {
+            bloom_filter: Arc::new(RwLock::new(bloom_filter)),
             index: Pin::new(Box::new(index)),
-            segment_path: Pin::new(Box::new(path)),
+            segment_path: Pin::new(path),
             size: Pin::new(Box::new(size)),
         }
     }
@@ -321,6 +365,14 @@ impl Segment {
 
     pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
         debug!("Searching for {} in {:?}", key, self.segment_path);
+        if !self
+            .bloom_filter
+            .try_read()
+            .unwrap()
+            .contains(&key.to_string())
+        {
+            return Ok(None);
+        }
         let hint = match self.index.get(key) {
             Some(hint) => hint,
             None => {
@@ -348,6 +400,16 @@ impl std::fmt::Display for Segment {
     }
 }
 
+impl Debug for Segment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Segment")
+            .field("index", &self.index)
+            .field("segment_path", &self.segment_path)
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
 impl Drop for Segment {
     fn drop(&mut self) {
         debug!("Dropped {}", self);
@@ -364,7 +426,7 @@ pub struct SegmentReader {
 impl SegmentReader {
     pub fn new(segment: &Segment) -> crate::Result<Self> {
         trace!("Creating segment reader from {}", segment);
-        let path = (*segment.segment_path).clone();
+        let path = PathBuf::from(&*segment.segment_path.clone());
         let reader = BufReader::new(File::open(&path)?);
         Ok(Self {
             path,
@@ -396,7 +458,7 @@ impl SegmentReader {
 
 impl Drop for SegmentReader {
     fn drop(&mut self) {
-        if self.complete {
+        if self.complete && self.path.exists() {
             trace!("Dropping segment reader {:?}. Deleting file.", &self.path);
             std::fs::remove_file(&self.path).unwrap();
         }
