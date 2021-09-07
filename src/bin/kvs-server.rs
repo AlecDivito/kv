@@ -1,12 +1,10 @@
 use clap_v3::{App, Arg};
 use kvs::*;
-use log::LevelFilter;
-use log::{error, info};
 use std::env::current_dir;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
 use std::process::exit;
 use std::str::FromStr;
+use tokio::net::TcpListener;
 
 const DEFAULT_LISTENING_ADDRESS: &str = "127.0.0.1";
 
@@ -37,8 +35,14 @@ impl std::fmt::Display for Engine {
     }
 }
 
-fn main() {
-    env_logger::builder().filter_level(LevelFilter::Info).init();
+#[tokio::main]
+async fn main() {
+    // enable logging
+    // see https://docs.rs/tracing for more info
+    if let Err(e) = tracing_subscriber::fmt::try_init() {
+        eprintln!("Failed to setup tracing: {}", e);
+        exit(2);
+    };
     let opt = App::new("kvs-server")
         .version("1.0.0")
         .author("Alec Di Vito")
@@ -68,29 +72,35 @@ fn main() {
     let address = opt.value_of("addr").unwrap();
     let port = opt.value_of("port").unwrap();
 
-    info!("kvs-server {}", env!("CARGO_PKG_VERSION"));
-    info!("Storage engine: {}", engine_str);
-    info!("Listening on {}", address);
+    println!("kvs-server {}", env!("CARGO_PKG_VERSION"));
+    println!("Storage engine: {}", engine_str);
+    println!("Listening on {}", address);
 
-    if let Err(e) = run(engine, address, port) {
-        error!("{}", e);
+    if let Err(e) = run(engine, address, port).await {
+        eprintln!("{}", e);
         exit(1);
     }
 }
 
-fn run_with_engine<E: KvsEngine>(engine: E, addr: impl Into<SocketAddr>) -> Result<()> {
-    let server = KvServer::new(engine);
-    server.run(addr.into())
+async fn run_with_engine<E: KvsEngine + 'static>(
+    engine: E,
+    ip: &str,
+    port: &str,
+) -> crate::Result<()> {
+    let listener = TcpListener::bind(format!("{}:{}", ip, port)).await?;
+    kvs::listen_with(engine, listener, tokio::signal::ctrl_c()).await?;
+    Ok(())
 }
 
-fn run(engine: Engine, address: &str, port: &str) -> Result<()> {
+async fn run(engine: Engine, ip: &str, port: &str) -> crate::Result<()> {
     fs::write(current_dir()?.join("engine"), format!("{}", engine))?;
-    let ip = SocketAddr::new(IpAddr::from_str(address).unwrap(), port.parse().unwrap());
 
     match engine {
-        Engine::Kvs => run_with_engine(KvStore::open("./.temp")?, ip)?,
-        Engine::Sled => run_with_engine(SledKvsEngine::open(current_dir()?.as_path())?, ip)?,
-    };
+        Engine::Kvs => run_with_engine(KvStore::open("./.temp")?, ip, port).await,
+        Engine::Sled => {
+            run_with_engine(SledKvsEngine::open(current_dir()?.as_path())?, ip, port).await
+        }
+    }?;
 
     Ok(())
 }

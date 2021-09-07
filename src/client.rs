@@ -1,4 +1,7 @@
-use crate::common::{GetResponse, RemoveResponse, Request, SetResponse};
+use crate::command::get::Get;
+use crate::command::remove::Remove;
+use crate::command::set::Set;
+use crate::command::{GetResponse, RemoveResponse, Request, SetResponse};
 use crate::{KvError, Result};
 use serde::Deserialize;
 use serde_json::de::IoRead;
@@ -25,7 +28,7 @@ impl KvClient {
 
     /// Get the value of a given key from the server.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        serde_json::to_writer(&mut self.writer, &Request::Get { key })?;
+        serde_json::to_writer(&mut self.writer, &Request::Get(Get::new(key)))?;
         self.writer.flush()?;
         let response = GetResponse::deserialize(&mut self.reader)?;
         match response {
@@ -36,7 +39,7 @@ impl KvClient {
 
     /// Set the value of a string key in the server.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, &Request::Set { key, value })?;
+        serde_json::to_writer(&mut self.writer, &Request::Set(Set::new(key, value)))?;
         self.writer.flush()?;
         let response = SetResponse::deserialize(&mut self.reader)?;
         match response {
@@ -47,7 +50,7 @@ impl KvClient {
 
     /// Remove a value from the key value store
     pub fn remove(&mut self, key: String) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, &Request::Remove { key })?;
+        serde_json::to_writer(&mut self.writer, &Request::Remove(Remove::new(key)))?;
         self.writer.flush()?;
         let resp = RemoveResponse::deserialize(&mut self.reader)?;
         match resp {

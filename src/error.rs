@@ -77,6 +77,8 @@ pub enum KvError {
     Lock(GenericError),
     /// Error with a string message
     StringError(GenericError),
+    /// Error to handle connection issues
+    Connection(GenericError),
 }
 
 /// `Result` is a error helper for `KvError`
@@ -96,6 +98,7 @@ impl fmt::Display for KvError {
             KvError::Sled(ref err) => write!(f, "Sled Err: {}", err),
             KvError::StringError(ref err) => write!(f, "String Error: {}", err),
             KvError::Lock(ref err) => write!(f, "Lock Error: {}", err),
+            KvError::Connection(ref err) => write!(f, "Connection Err: {}", err),
         }
     }
 }
@@ -114,6 +117,7 @@ impl error::Error for KvError {
             KvError::Sled(ref err) => Some(err),
             KvError::StringError(ref err) => Some(err),
             KvError::Lock(ref err) => Some(err),
+            KvError::Connection(ref err) => Some(err),
         }
     }
 }
