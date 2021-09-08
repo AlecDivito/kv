@@ -8,19 +8,20 @@ use sled::{open, Db, Tree};
 #[derive(Clone)]
 pub struct SledKvsEngine(Db);
 
+#[async_trait::async_trait]
 impl KvsEngine for SledKvsEngine {
-    fn open(folder: impl Into<PathBuf>) -> Result<SledKvsEngine> {
-        Ok(SledKvsEngine(open(folder.into())?))
+    async fn open(folder: PathBuf) -> Result<SledKvsEngine> {
+        Ok(SledKvsEngine(open(folder)?))
     }
 
-    fn set(&self, key: String, value: String) -> Result<()> {
+    async fn set(&self, key: String, value: String) -> Result<()> {
         let tree: &Tree = &self.0;
         tree.insert(key, value.into_bytes()).map(|_| ())?;
         tree.flush()?;
         Ok(())
     }
 
-    fn get(&self, key: String) -> Result<Option<String>> {
+    async fn get(&self, key: String) -> Result<Option<String>> {
         let tree: &Tree = &self.0;
         Ok(tree
             .get(key)?
@@ -29,7 +30,7 @@ impl KvsEngine for SledKvsEngine {
             .transpose()?)
     }
 
-    fn remove(&self, key: String) -> Result<()> {
+    async fn remove(&self, key: String) -> Result<()> {
         let tree: &Tree = &self.0;
         tree.remove(key)?
             .ok_or(KvError::KeyNotFound(GenericError::new(
