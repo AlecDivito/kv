@@ -53,3 +53,15 @@ KvStore::open(path: impl Into<PathBuf>) -> Result<KvStore>
 | Log compaction  | Process of reducing the size of the database by removing stale commits |
 | In-memory index | A map of keys to log pointers                                          |
 | Index file      | The on-disk representation of the in-memory index                      |
+
+## Performance right now
+
+```text
+    Finished dev [unoptimized + debuginfo] target(s) in 0.05s
+     Running `target/debug/kvs-client test set 1000000`
+
+________________________________________________________
+Executed in  243.37 secs   fish           external
+   usr time   99.92 secs  214.00 micros   99.92 secs
+   sys time   42.13 secs  200.00 micros   42.13 secs
+```

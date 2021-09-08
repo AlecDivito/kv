@@ -1,4 +1,4 @@
-use std::io::Cursor;
+use std::io::{Cursor, Seek, SeekFrom};
 
 use serde_json::error::Category;
 use tokio::{
@@ -64,10 +64,14 @@ impl Connection {
     /// there is enough data, that is removed from the buffer.
     fn parse_request(&mut self) -> crate::Result<Option<Request>> {
         // create a cursor which will access our buffer.
-        let mut buf = Cursor::new(&self.buffer[..]);
+        let buffer = std::mem::take(&mut self.buffer);
+        let mut buf = Cursor::new(&buffer);
 
         match serde_json::from_reader(&mut buf) {
-            Ok(request) => Ok(Some(request)),
+            Ok(request) => {
+                self.buffer = buffer[buf.stream_position()? as usize..].to_vec();
+                Ok(Some(request))
+            }
             Err(e) => match e.classify() {
                 Category::Io => Err(KvError::Json(e)),
                 Category::Syntax => Ok(None),
@@ -78,21 +82,22 @@ impl Connection {
     }
 
     pub async fn write(&mut self, response: Response) -> crate::Result<()> {
-        let src = match response {
-            Response::Get(get) => serde_json::to_vec(&match get {
-                GetResponse::Ok(v) => GetResponse::Ok(v),
-                GetResponse::Err(e) => GetResponse::Err(format!("{}", e)),
-            }),
-            Response::Set(set) => serde_json::to_vec(&match set {
-                SetResponse::Ok(_) => SetResponse::Ok(()),
-                SetResponse::Err(e) => SetResponse::Err(format!("{}", e)),
-            }),
-            Response::Remove(rm) => serde_json::to_vec(&match rm {
-                RemoveResponse::Ok(_) => RemoveResponse::Ok(()),
-                RemoveResponse::Err(e) => RemoveResponse::Err(format!("{}", e)),
-            }),
-        }?;
-        self.stream.write_all(&src).await?;
+        let response = serde_json::to_vec(&response)?;
+        // let src = match response {
+        //     Response::Get(get) => serde_json::to_vec(&match get {
+        //         GetResponse::Ok(v) => GetResponse::Ok(v),
+        //         GetResponse::Err(e) => GetResponse::Err(format!("{}", e)),
+        //     }),
+        //     Response::Set(set) => serde_json::to_vec(&match set {
+        //         SetResponse::Ok(_) => SetResponse::Ok(()),
+        //         SetResponse::Err(e) => SetResponse::Err(format!("{}", e)),
+        //     }),
+        //     Response::Remove(rm) => serde_json::to_vec(&match rm {
+        //         RemoveResponse::Ok(_) => RemoveResponse::Ok(()),
+        //         RemoveResponse::Err(e) => RemoveResponse::Err(format!("{}", e)),
+        //     }),
+        // }?;
+        self.stream.write_all(&response).await?;
         Ok(self.stream.flush().await?)
     }
 
@@ -133,8 +138,14 @@ impl Connection {
     /// there is enough data, that is removed from the buffer.
     fn parse_response(&mut self) -> crate::Result<Option<Response>> {
         // create a cursor which will access our buffer.
-        match serde_json::from_slice(&self.buffer) {
-            Ok(repsonse) => Ok(Some(repsonse)),
+        let buffer = std::mem::take(&mut self.buffer);
+        let mut buf = Cursor::new(&buffer);
+
+        match serde_json::from_reader(&mut buf) {
+            Ok(request) => {
+                self.buffer = buffer[buf.stream_position()? as usize..].to_vec();
+                Ok(Some(request))
+            }
             Err(e) => match e.classify() {
                 Category::Io => Err(KvError::Json(e)),
                 Category::Syntax => Ok(None),
@@ -146,6 +157,11 @@ impl Connection {
 
     pub async fn flush(&mut self) -> crate::Result<()> {
         self.stream.flush().await?;
+        Ok(())
+    }
+
+    pub async fn close(&mut self) -> crate::Result<()> {
+        self.stream.shutdown().await?;
         Ok(())
     }
 }

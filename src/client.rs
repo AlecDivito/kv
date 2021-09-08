@@ -45,6 +45,7 @@ impl KvClient {
                 }
             }
         }
+        self.connection.close().await?;
         Ok(None)
     }
 
@@ -65,6 +66,7 @@ impl KvClient {
                 }
             }
         }
+        self.connection.close().await?;
         Ok(())
     }
 
@@ -85,12 +87,13 @@ impl KvClient {
                 }
             }
         }
+        self.connection.close().await?;
         Ok(())
     }
 
     /// Test the api by sending large continous requests
     pub async fn test(&mut self, operation: &str, amount: usize) -> Result<()> {
-        self.flush_after_request(false);
+        // self.flush_after_request(false);
         match operation {
             "get" => {
                 for number in 0..amount {
@@ -112,7 +115,7 @@ impl KvClient {
                     }
                     let key = format!("Key{}", number);
                     let value = format!("Value{}", number);
-                    println!("{}: Set {} and {}", number, key, value);
+                    // println!("{}: Set {} and {}", number, key, value);
                     self.set(key, value).await?;
                 }
             }
