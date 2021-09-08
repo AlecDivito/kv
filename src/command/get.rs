@@ -30,7 +30,7 @@ impl Get {
         engine: &E,
         connection: &mut Connection,
     ) -> crate::Result<()> {
-        let response = match engine.get(self.key) {
+        let response = match engine.get(self.key).await {
             Ok(v) => GetResponse::Ok(v),
             Err(e) => match e {
                 _ => GetResponse::Err(format!("{}", e)),

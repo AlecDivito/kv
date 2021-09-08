@@ -47,6 +47,10 @@ impl Connection {
             //
             // `0` indicated the end of the stream.
             if 0 == self.stream.read_buf(&mut self.buffer).await? {
+                // The remote closed the connection. For this to be a clean
+                // shutdown, there should be no data in the read buffer. If
+                // there is, this means that the peer closed the socket
+                // before sending the full request.
                 if self.buffer.is_empty() {
                     return Ok(None);
                 } else {
@@ -90,5 +94,58 @@ impl Connection {
         }?;
         self.stream.write_all(&src).await?;
         Ok(self.stream.flush().await?)
+    }
+
+    /// Write a single `Request` value to the underlying stream. This is mainly
+    /// used by client applications to send values to the key value store.
+    pub async fn send(&mut self, request: Request) -> crate::Result<()> {
+        self.stream.write(&serde_json::to_vec(&request)?).await?;
+        Ok(())
+    }
+
+    pub async fn recieve(&mut self) -> crate::Result<Option<Response>> {
+        loop {
+            // Attempt to parse the buffer to retrieve the request.
+            // If enough data has been buffered, the request is returned
+            if let Some(response) = self.parse_response()? {
+                return Ok(Some(response));
+            }
+
+            // The buffer is still too empty to parse, read more data from the
+            // socket.
+            //
+            // `0` indicated the end of the stream.
+            if 0 == self.stream.read_buf(&mut self.buffer).await? {
+                // The remote closed the connection. For this to be a clean
+                // shutdown, there should be no data in the read buffer. If
+                // there is, this means that the peer closed the socket
+                // before sending the full request.
+                if self.buffer.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Err(KvError::Connection("Connection was reset by peer".into()));
+                }
+            }
+        }
+    }
+
+    /// Tries to parse the buffer. If the buffer contains enough data. If
+    /// there is enough data, that is removed from the buffer.
+    fn parse_response(&mut self) -> crate::Result<Option<Response>> {
+        // create a cursor which will access our buffer.
+        match serde_json::from_slice(&self.buffer) {
+            Ok(repsonse) => Ok(Some(repsonse)),
+            Err(e) => match e.classify() {
+                Category::Io => Err(KvError::Json(e)),
+                Category::Syntax => Ok(None),
+                Category::Data => Err(KvError::Json(e)),
+                Category::Eof => Ok(None),
+            },
+        }
+    }
+
+    pub async fn flush(&mut self) -> crate::Result<()> {
+        self.stream.flush().await?;
+        Ok(())
     }
 }

@@ -30,7 +30,7 @@ impl Remove {
         engine: &E,
         connection: &mut Connection,
     ) -> crate::Result<()> {
-        let response = match engine.remove(self.key) {
+        let response = match engine.remove(self.key).await {
             Ok(v) => RemoveResponse::Ok(v),
             Err(e) => match e {
                 _ => RemoveResponse::Err(format!("{}", e)),

@@ -2,6 +2,7 @@ use clap_v3::{App, Arg};
 use kvs::*;
 use std::env::current_dir;
 use std::fs;
+use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
 use tokio::net::TcpListener;
@@ -96,10 +97,10 @@ async fn run(engine: Engine, ip: &str, port: &str) -> crate::Result<()> {
     fs::write(current_dir()?.join("engine"), format!("{}", engine))?;
 
     match engine {
-        Engine::Kvs => run_with_engine(KvStore::open("./.temp")?, ip, port).await,
-        Engine::Sled => {
-            run_with_engine(SledKvsEngine::open(current_dir()?.as_path())?, ip, port).await
+        Engine::Kvs => {
+            run_with_engine(KvStore::open(PathBuf::from("./.temp")).await?, ip, port).await
         }
+        Engine::Sled => run_with_engine(SledKvsEngine::open(current_dir()?).await?, ip, port).await,
     }?;
 
     Ok(())

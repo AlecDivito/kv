@@ -7,8 +7,7 @@ use std::sync::RwLockWriteGuard;
 use std::sync::TryLockError;
 use std::{error, string::FromUtf8Error};
 
-use crate::engines::kvs3::Level;
-use crate::engines::kvs3::Storage;
+use crate::engines::kvs::{Level, Storage};
 
 /// Generic Error because right now i'm to lazy to implement an actually good
 /// error class

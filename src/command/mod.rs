@@ -35,6 +35,7 @@ impl Request {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Response {
     Get(GetResponse),
     Set(SetResponse),

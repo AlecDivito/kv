@@ -34,7 +34,7 @@ impl Set {
         engine: &E,
         connection: &mut Connection,
     ) -> crate::Result<()> {
-        let response = match engine.set(self.key, self.value) {
+        let response = match engine.set(self.key, self.value).await {
             Ok(v) => SetResponse::Ok(v),
             Err(e) => match e {
                 _ => SetResponse::Err(format!("{}", e)),

@@ -1,12 +1,11 @@
 use clap_v3::{App, Arg, ArgMatches};
 use kvs::{KvClient, KvError, Result};
-use std::net::{IpAddr, SocketAddr};
 use std::process::exit;
-use std::str::FromStr;
 
 const DEFAULT_LISTENING_ADDRESS: &str = "127.0.0.1";
 
-fn main() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> kvs::Result<()> {
     let opt = App::new("kvs-client")
         .version("1.0.0")
         .author("Alec Di Vito")
@@ -51,33 +50,38 @@ fn main() {
         )
         .get_matches();
 
-    if let Err(e) = run(opt) {
+    if let Err(e) = run(opt).await {
         eprintln!("{}", e);
         exit(1);
     }
+    Ok(())
 }
 
-fn run(opt: ArgMatches) -> Result<()> {
-    let addr = opt.value_of("addr").unwrap();
+async fn run(opt: ArgMatches) -> Result<()> {
+    let host = opt.value_of("addr").unwrap();
     let port = opt.value_of("port").unwrap();
-    let ip = SocketAddr::new(IpAddr::from_str(addr).unwrap(), port.parse().unwrap());
-    let mut client = KvClient::connect(ip)?;
+    let addr = format!("{}:{}", host, port);
+    let mut client = KvClient::connect(addr).await?;
     match opt.subcommand() {
         ("get", Some(sub)) => {
-            if let Some(value) = client.get(sub.value_of("key").unwrap().to_string())? {
+            if let Some(value) = client.get(sub.value_of("key").unwrap().to_string()).await? {
                 println!("{}", value);
             } else {
                 println!("Key not found");
             }
         }
         ("set", Some(sub)) => {
-            client.set(
-                sub.value_of("key").unwrap().to_string(),
-                sub.value_of("value").unwrap().to_string(),
-            )?;
+            client
+                .set(
+                    sub.value_of("key").unwrap().to_string(),
+                    sub.value_of("value").unwrap().to_string(),
+                )
+                .await?;
         }
         ("rm", Some(sub)) => {
-            client.remove(sub.value_of("key").unwrap().to_string())?;
+            client
+                .remove(sub.value_of("key").unwrap().to_string())
+                .await?;
         }
         ("test", Some(sub)) => {
             let operation = match sub.value_of("operation") {
@@ -93,31 +97,7 @@ fn run(opt: ArgMatches) -> Result<()> {
                 .parse::<usize>()
                 .map_err(|_| KvError::Parse("The test amount was not a valid number".into()))?;
 
-            for number in 0..amount {
-                let key = format!("Key{}", number);
-                match operation {
-                    "get" => {
-                        if let Some(value) = client.get(key.clone())? {
-                            println!("{}: {} = {}", number, key, value);
-                        } else {
-                            println!("{}: {} could not be found", number, key);
-                        }
-                    }
-                    "set" => {
-                        let value = format!("Value{}", number);
-                        println!("{}: Set {} and {}", number, key, value);
-                        client.set(key, value)?;
-                    }
-                    "rm" => {
-                        println!("{}: Removed {}", number, key);
-                        client.remove(key)?;
-                    }
-                    _ => {
-                        println!("This shouldn't execte. Exitting...");
-                        std::process::exit(1);
-                    }
-                }
-            }
+            client.test(operation, amount).await?;
         }
         (_, _) => return Err(KvError::Parse("Command does not exist".to_string().into())),
     }
