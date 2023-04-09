@@ -72,10 +72,10 @@ impl std::fmt::Display for Record {
     }
 }
 
-#[derive(Clone, Debug)]
 /// MemoryTable keeps a tree of key and values in sorted order. Once it reaches
 /// a certian size, the table is moved to disk and a new empty one would take
 /// its place.
+#[derive(Clone, Debug)]
 struct MemoryTable {
     inner: Arc<RwLock<BTreeMap<String, Option<String>>>>,
     size: Arc<RwLock<usize>>,
@@ -97,7 +97,7 @@ impl MemoryTable {
             size: Arc::new(RwLock::new(0)),
         };
         let mut reader = BufReader::new(File::open(path)?);
-        while reader.fill_buf().unwrap().len() != 0 {
+        while !reader.fill_buf().unwrap().is_empty() {
             let record: Record = bincode::deserialize_from(&mut reader).unwrap();
             if record.crc != record.calculate_crc() {
                 let actual_crc = record.calculate_crc();
@@ -144,9 +144,9 @@ impl MemoryTable {
         let mut block_start = size;
         for (key, value) in table.iter() {
             let record = Record::new(key.clone(), value.clone());
-            let mut bytes = bincode::serialize(&record)?;
+            let bytes = bincode::serialize(&record)?;
             block_start += index.add(block_start, record)?;
-            size += writer.write(&mut bytes)?;
+            size += writer.write(&bytes)?;
         }
 
         drop(table);
@@ -181,7 +181,7 @@ impl SSTable {
     /// should be created to save data on write.
     pub fn new(directory: impl Into<PathBuf>) -> crate::Result<Self> {
         let directory = directory.into();
-        let path = (&directory).join(format!("{}.redo", Uuid::new_v4()));
+        let path = directory.join(format!("{}.redo", Uuid::new_v4()));
         let writer = BufWriter::new(File::create(&path)?);
         Ok(Self {
             inner: MemoryTable::new(),
@@ -208,8 +208,7 @@ impl SSTable {
         let record = Record::new(key, value);
         let bytes = bincode::serialize(&record)?;
         let mut lock = self.write_ahead_log.lock().unwrap();
-        lock.write(&bytes)?;
-        lock.flush()?;
+        lock.write_all(&bytes)?;
         drop(lock);
         Ok(self.inner.append(record))
     }
@@ -326,7 +325,7 @@ impl BlockHint {
 
         let mut counter = 0;
         while counter <= self.number_of_elements {
-            if reader.fill_buf().unwrap().len() == 0 {
+            if reader.fill_buf().unwrap().is_empty() {
                 return Ok(None);
             }
             counter += 1;
@@ -398,11 +397,11 @@ impl Index {
             match hints[middle].compare(key) {
                 Compare::Higher => {
                     hints = &hints[middle..self.hints.len()];
-                    middle = middle / 2;
+                    middle /= 2;
                 }
                 Compare::Lower => {
                     hints = &hints[0..middle];
-                    middle = middle / 2;
+                    middle /= 2;
                 }
                 Compare::Equal => return &hints[middle],
             }
@@ -454,12 +453,12 @@ impl Segment {
         let segment_path = path.into();
         debug!("Reading segment from log: {:?}", &segment_path);
         let mut reader = BufReader::new(File::open(&segment_path)?);
-        let mut size_buffer = (0 as usize).to_be_bytes();
+        let mut size_buffer = 0_usize.to_be_bytes();
         let mut block_start = reader.read(&mut size_buffer)?;
         let elements = usize::from_be_bytes(size_buffer);
 
         let mut index = Index::new(elements);
-        while reader.fill_buf().unwrap().len() != 0 {
+        while !reader.fill_buf().unwrap().is_empty() {
             let record: Record = bincode::deserialize_from(&mut reader).unwrap();
             block_start += index.add(block_start, record)?;
         }
@@ -515,15 +514,15 @@ impl Segment {
             let writeable_record = groupped_records.pop().unwrap();
 
             // write the record to our database
-            let mut bytes = bincode::serialize(&writeable_record)?;
+            let bytes = bincode::serialize(&writeable_record)?;
             block_start += index.add(block_start, writeable_record)?;
-            size += writer.write(&mut bytes)?;
+            size += writer.write(&bytes)?;
             count += 1;
         }
 
         // rewrite first 8 bytes to have the correct count of elements in the file
-        writer.seek(SeekFrom::Start(0))?;
-        writer.write(&count.to_be_bytes())?;
+        writer.rewind()?;
+        writer.write_all(&count.to_be_bytes())?;
 
         Ok(Segment::new(index, segment_path, size))
     }
@@ -590,8 +589,8 @@ impl SegmentReader {
         trace!("Creating segment reader from {}", segment);
         let path = PathBuf::from(&*segment.segment_path.clone());
         let mut reader = BufReader::new(File::open(&path)?);
-        let mut size_buffer = (0 as usize).to_be_bytes();
-        reader.read(&mut size_buffer)?;
+        let mut size_buffer = 0_usize.to_be_bytes();
+        reader.read_exact(&mut size_buffer)?;
         let elements = usize::from_be_bytes(size_buffer);
         Ok(Self {
             path,
@@ -602,17 +601,15 @@ impl SegmentReader {
     }
 
     pub fn next(&mut self) -> crate::Result<()> {
-        if self.value.is_none() {
-            if !self.done() {
-                let record = bincode::deserialize_from(&mut self.reader)?;
-                trace!("Found next {} in {:?}", record, self.path);
-                self.value.insert(record);
-            }
+        if self.value.is_none() && !self.done() {
+            let record = bincode::deserialize_from(&mut self.reader)?;
+            trace!("Found next {} in {:?}", record, self.path);
+            let _ = self.value.insert(record);
         }
         Ok(())
     }
 
     pub fn done(&mut self) -> bool {
-        self.reader.fill_buf().unwrap().len() == 0 && self.value.is_none()
+        self.reader.fill_buf().unwrap().is_empty() && self.value.is_none()
     }
 }

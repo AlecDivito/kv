@@ -49,7 +49,7 @@ impl<E: KvsEngine> KvServer<E> {
                 serde_json::to_writer(&mut writer, &response)?;
                 writer.flush()?;
                 // debug!("Response sent to {}: {:?}", peer_addr, response);
-            };};
+            }};
         }
 
         for req in req_reader {

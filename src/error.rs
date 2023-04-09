@@ -26,17 +26,17 @@ impl GenericError {
     }
 }
 
-impl Into<GenericError> for &str {
-    fn into(self) -> GenericError {
+impl From<&str> for GenericError {
+    fn from(str: &str) -> GenericError {
         GenericError {
-            details: self.to_string(),
+            details: str.to_string(),
         }
     }
 }
 
-impl Into<GenericError> for String {
-    fn into(self) -> GenericError {
-        GenericError { details: self }
+impl From<String> for GenericError {
+    fn from(val: String) -> Self {
+        GenericError { details: val }
     }
 }
 

@@ -98,13 +98,11 @@ impl Level {
     pub fn update_level(&self, next_path: impl Into<PathBuf>) -> crate::Result<Option<Segment>> {
         let segments = self.segments.try_read()?;
         let length = segments.len();
-        if let Some((index, table)) = segments.iter().enumerate().find_map(|(u, s)| {
-            if let Some(t) = s.sstable() {
-                Some((u, t))
-            } else {
-                None
-            }
-        }) {
+        if let Some((index, table)) = segments
+            .iter()
+            .enumerate()
+            .find_map(|(u, s)| s.sstable().map(|t| (u, t)))
+        {
             let new_segment = table.save(self.directory.join(format!("{}.log", now())))?;
             trace!("Created new {} from {}", new_segment, table);
             let length = segments.len();
@@ -206,7 +204,7 @@ impl Levels {
         let mut level = 2;
         let mut levels = vec![Level::new(&directory, 1)?];
         loop {
-            let lvl_dir = (&directory).join(format!("lv{}", level));
+            let lvl_dir = directory.join(format!("lv{}", level));
             if !lvl_dir.exists() {
                 break;
             }
@@ -227,7 +225,7 @@ impl Levels {
         let mut new_segment_file = None;
 
         loop {
-            let next_path = (&*directory).join(format!("lv{}", level_index));
+            let next_path = (*directory).join(format!("lv{}", level_index));
 
             if !next_path.exists() {
                 trace!("level folder does not exist. Creating {:?}", &next_path);
@@ -261,8 +259,8 @@ impl Levels {
                 );
             }
 
-            level_index = level_index + 1;
-            index = index + 1;
+            level_index += 1;
+            index += 1;
         }
     }
 
@@ -334,13 +332,11 @@ impl KvsEngine for KvStore {
         if !directory.exists() {
             debug!("Failed to find {:?}; creating it", directory);
             std::fs::create_dir_all(&directory)?;
-        } else {
-            if !directory.is_dir() {
-                debug!("Linked directory {:?} is a file", directory);
-                return Err(KvError::Parse(
-                    format!("{:?} is not a directory", directory).into(),
-                ));
-            }
+        } else if !directory.is_dir() {
+            debug!("Linked directory {:?} is a file", directory);
+            return Err(KvError::Parse(
+                format!("{:?} is not a directory", directory).into(),
+            ));
         }
 
         let dir = std::fs::read_dir(&directory)?;
@@ -353,7 +349,7 @@ impl KvsEngine for KvStore {
                     // TODO: If we find multiple redo logs on startup, we should
                     // just compress them right now. At least we should include
                     // an option for the user to submit.
-                    redo_log_path = Some(PathBuf::from(entry.path()));
+                    redo_log_path = Some(entry.path());
                     break;
                 }
             }
@@ -361,7 +357,7 @@ impl KvsEngine for KvStore {
 
         let levels = Levels::new(directory.as_path())?;
         let sstable = match redo_log_path {
-            Some(file) => SSTable::from_write_ahead_log(&file),
+            Some(file) => SSTable::from_write_ahead_log(file),
             None => SSTable::new(&directory),
         }?;
 
