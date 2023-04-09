@@ -30,7 +30,7 @@ language).
 
 [Link to Building block](https://github.com/pingcap/talent-plan/blob/master/courses/rust/building-blocks/bb-3.md)
 
-This chapter focuses on refactoring the project so that it is accessable
+This chapter focuses on refactoring the project so that it is accessible
 over a server and client tool with a TCP socket. It also jumps into
 comparing your solution to other production systems such as sled.
 Implementation Sled inside of our database and start bench marking it.

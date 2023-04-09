@@ -1,7 +1,7 @@
 # Damn Cool Algorithms: Log structured storage
 
 This document is a small summary of the following article:
-[Damn cool Algorithms: Log structed storage](http://blog.notdot.net/2009/12/Damn-Cool-Algorithms-Log-structured-storage)
+[Damn cool Algorithms: Log structured storage](http://blog.notdot.net/2009/12/Damn-Cool-Algorithms-Log-structured-storage)
 
 ## What is it
 

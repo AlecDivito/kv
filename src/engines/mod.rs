@@ -39,12 +39,14 @@ pub trait KvsEngine: Clone + Send + Sync {
 mod sstable;
 
 /// kvs is this libraries implementation of a key value store
-// pub mod kvs;
-// pub mod kvs2;
-pub mod kvs3;
+pub mod kvs;
+
+/// kvs store that keeps all data in a library
+pub mod memory;
 
 /// sled is a already implemented library in rust
 pub mod sled;
 
-pub use self::kvs3::KvStore;
+pub use self::kvs::KvStore;
+pub use self::memory::KvInMemoryStore;
 pub use self::sled::SledKvsEngine;

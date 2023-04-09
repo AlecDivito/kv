@@ -13,6 +13,7 @@ const DEFAULT_LISTENING_ADDRESS: &str = "127.0.0.1";
 enum Engine {
     Kvs,
     Sled,
+    Memory,
 }
 
 impl FromStr for Engine {
@@ -22,6 +23,7 @@ impl FromStr for Engine {
         match s {
             "kvs" => Ok(Engine::Kvs),
             "sled" => Ok(Engine::Sled),
+            "memory" => Ok(Engine::Memory),
             _ => Err("no match"),
         }
     }
@@ -32,6 +34,7 @@ impl std::fmt::Display for Engine {
         let s = match self {
             Engine::Kvs => "kvs",
             Engine::Sled => "sled",
+            Engine::Memory => "memory",
         };
         write!(f, "{}", s)
     }
@@ -90,6 +93,7 @@ fn run(engine: Engine, address: &str, port: &str) -> Result<()> {
     match engine {
         Engine::Kvs => run_with_engine(KvStore::open("./.temp")?, ip)?,
         Engine::Sled => run_with_engine(SledKvsEngine::open(current_dir()?.as_path())?, ip)?,
+        Engine::Memory => run_with_engine(KvInMemoryStore::open("").unwrap(), ip)?,
     };
 
     Ok(())

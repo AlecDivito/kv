@@ -39,7 +39,7 @@ impl<E: KvsEngine> KvServer<E> {
     }
 
     fn serve(&mut self, tcp: TcpStream) -> Result<()> {
-        // let peer_addr = tcp.peer_addr()?;
+        let peer_addr = tcp.peer_addr()?;
         let reader = BufReader::new(&tcp);
         let mut writer = BufWriter::new(&tcp);
         let req_reader = Deserializer::from_reader(reader).into_iter::<Request>();
@@ -48,13 +48,13 @@ impl<E: KvsEngine> KvServer<E> {
                 let response = $resp;
                 serde_json::to_writer(&mut writer, &response)?;
                 writer.flush()?;
-                // debug!("Response sent to {}: {:?}", peer_addr, response);
+                info!("Response sent to {}: {:?}", peer_addr, response);
             }};
         }
 
         for req in req_reader {
             let req = req?;
-            // info!("Receive request from {}: {:?}", peer_addr, req);
+            info!("Receive request from {}: {:?}", peer_addr, req);
             match req {
                 Request::Get { key } => send_response!(match self.engine.get(key) {
                     Ok(v) => GetResponse::Ok(v),
