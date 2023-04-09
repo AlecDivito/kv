@@ -39,7 +39,7 @@ impl BloomFilter {
             RandomState::new().build_hasher(),
         ];
         BloomFilter {
-            bitmap: BitVec::from_elem(optimal_m as usize, false),
+            bitmap: BitVec::from_elem(optimal_m, false),
             optimal_m,
             optimal_k,
             hashers,
