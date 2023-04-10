@@ -1,14 +1,6 @@
 use std::fmt;
 use std::io;
-use std::path::PathBuf;
-use std::sync::PoisonError;
-use std::sync::RwLockReadGuard;
-use std::sync::RwLockWriteGuard;
-use std::sync::TryLockError;
 use std::{error, string::FromUtf8Error};
-
-use crate::engines::kvs::Level;
-use crate::engines::kvs::Storage;
 
 /// Generic Error because right now i'm to lazy to implement an actually good
 /// error class
@@ -151,35 +143,5 @@ impl From<FromUtf8Error> for KvError {
 impl From<sled::Error> for KvError {
     fn from(err: sled::Error) -> Self {
         KvError::Sled(err)
-    }
-}
-
-impl From<TryLockError<RwLockReadGuard<'_, Vec<Storage>>>> for KvError {
-    fn from(e: TryLockError<RwLockReadGuard<'_, Vec<Storage>>>) -> Self {
-        KvError::Lock(format!("Read Lock Err: {}", e).into())
-    }
-}
-
-impl From<PoisonError<RwLockReadGuard<'_, Vec<Level>>>> for KvError {
-    fn from(e: PoisonError<RwLockReadGuard<'_, Vec<Level>>>) -> Self {
-        KvError::Lock(format!("Read Lock Err: {}", e).into())
-    }
-}
-
-impl From<PoisonError<RwLockReadGuard<'_, PathBuf>>> for KvError {
-    fn from(e: PoisonError<RwLockReadGuard<'_, PathBuf>>) -> Self {
-        KvError::Lock(format!("Read Lock Err: {}", e).into())
-    }
-}
-
-impl From<TryLockError<RwLockWriteGuard<'_, Vec<Storage>>>> for KvError {
-    fn from(e: TryLockError<RwLockWriteGuard<'_, Vec<Storage>>>) -> Self {
-        KvError::Lock(format!("Write Lock Err: {}", e).into())
-    }
-}
-
-impl From<PoisonError<RwLockWriteGuard<'_, Vec<Level>>>> for KvError {
-    fn from(e: PoisonError<RwLockWriteGuard<'_, Vec<Level>>>) -> Self {
-        KvError::Lock(format!("Write Lock Err: {}", e).into())
     }
 }

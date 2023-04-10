@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::{common::now, KvError, KvsEngine};
+use crate::common::now;
 
 use super::sstable::{SSTable, Segment, SegmentReader};
 
@@ -96,7 +96,7 @@ impl Level {
     /// With the level having the correct state, it then tries to merge it's file
     /// if, and only if, it reaches the given threshold.
     pub fn update_level(&self, next_path: impl Into<PathBuf>) -> crate::Result<Option<Segment>> {
-        let segments = self.segments.try_read()?;
+        let segments = self.segments.read().unwrap();
         let length = segments.len();
         if let Some((index, table)) = segments
             .iter()
@@ -130,14 +130,14 @@ impl Level {
         trace!(
             "Adding {} to {:?}",
             storage,
-            self.segments.try_read()?.len()
+            self.segments.read().unwrap().len()
         );
         self.segments.write().unwrap().push(storage);
         Ok(())
     }
 
     pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
-        for level in self.segments.try_read()?.iter().rev() {
+        for level in self.segments.read().unwrap().iter().rev() {
             if let Some(value) = match level {
                 Storage::SSTable(s) => s.get(key),
                 Storage::Segment(s) => s.get(key)?,
@@ -193,7 +193,7 @@ fn clamp(level: usize, min: usize) -> usize {
 }
 
 #[derive(Clone)]
-struct Levels {
+pub struct Levels {
     inner: Arc<RwLock<Vec<Level>>>,
     directory: Arc<RwLock<PathBuf>>,
 }
@@ -219,7 +219,7 @@ impl Levels {
     }
 
     pub fn try_merge(&self) -> crate::Result<()> {
-        let directory = (self.directory.read()?).clone();
+        let directory = (self.directory.read().unwrap()).clone();
         let mut index = 0;
         let mut level_index = 2;
         let mut new_segment_file = None;
@@ -231,13 +231,13 @@ impl Levels {
                 trace!("level folder does not exist. Creating {:?}", &next_path);
                 std::fs::create_dir(&next_path)?;
             }
-            let inner = self.inner.read()?;
+            let inner = self.inner.read().unwrap();
             let level = match inner.get(index) {
                 Some(level) => level.clone(),
                 None => {
                     drop(inner);
                     let level = Level::new(&*directory, level_index)?;
-                    self.inner.write()?.push(level.clone());
+                    self.inner.write().unwrap().push(level.clone());
                     level
                 }
             };
@@ -277,115 +277,5 @@ impl Levels {
     pub fn add_table(&self, sstable: SSTable) -> crate::Result<()> {
         self.inner.read().unwrap()[0].add(Storage::SSTable(sstable))?;
         Ok(())
-    }
-}
-
-/// KvStore stores all the data for the kvstore
-#[derive(Clone)]
-pub struct KvStore {
-    directory: Arc<RwLock<PathBuf>>,
-    sstable: Arc<RwLock<SSTable>>,
-    levels: Levels,
-}
-
-impl KvStore {
-    fn write(&self, key: String, value: Option<String>) -> crate::Result<()> {
-        let new_size = self.sstable.read().unwrap().append(key, value)?;
-
-        if new_size > 256 * 1000 * 1000 {
-            // sstable is too large, rotate
-            let directory = &*self.directory.read().unwrap();
-            let new_sstable = SSTable::new(directory)?;
-            let mut sstable = self.sstable.write().unwrap();
-            let old_sstable = std::mem::replace(&mut *sstable, new_sstable);
-            drop(sstable);
-            self.levels.add_table(old_sstable)?;
-            let levels = self.levels.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = levels.try_merge() {
-                    error!("Failed to succesfully merge with error {}", e)
-                } else {
-                    info!("Successfully merged levels together");
-                }
-            });
-        }
-        Ok(())
-    }
-
-    /// Add a value to our key value store
-    pub fn add(&self, key: String, value: String) -> crate::Result<()> {
-        self.write(key, Some(value))
-    }
-
-    /// remove a value from our key value store
-    pub fn remove(&self, key: String) -> crate::Result<()> {
-        self.write(key, None)
-    }
-}
-
-impl KvsEngine for KvStore {
-    fn open(folder: impl Into<PathBuf>) -> crate::Result<Self>
-    where
-        Self: Sized,
-    {
-        let directory: PathBuf = folder.into();
-        if !directory.exists() {
-            debug!("Failed to find {:?}; creating it", directory);
-            std::fs::create_dir_all(&directory)?;
-        } else if !directory.is_dir() {
-            debug!("Linked directory {:?} is a file", directory);
-            return Err(KvError::Parse(
-                format!("{:?} is not a directory", directory).into(),
-            ));
-        }
-
-        let dir = std::fs::read_dir(&directory)?;
-        let mut redo_log_path = None;
-        for entry in dir {
-            let entry = entry?;
-            if let Some(s) = entry.path().extension() {
-                if s == "redo" {
-                    trace!("Found redo log: {:?}", entry.path());
-                    // TODO: If we find multiple redo logs on startup, we should
-                    // just compress them right now. At least we should include
-                    // an option for the user to submit.
-                    redo_log_path = Some(entry.path());
-                    break;
-                }
-            }
-        }
-
-        let levels = Levels::new(directory.as_path())?;
-        let sstable = match redo_log_path {
-            Some(file) => SSTable::from_write_ahead_log(file),
-            None => SSTable::new(&directory),
-        }?;
-
-        info!("State read, application ready for requests");
-        Ok(Self {
-            directory: Arc::new(RwLock::new(directory)),
-            sstable: Arc::new(RwLock::new(sstable)),
-            levels,
-        })
-    }
-
-    fn set(&self, key: String, value: String) -> crate::Result<()> {
-        self.add(key, value)
-    }
-
-    fn get(&self, key: String) -> crate::Result<Option<String>> {
-        match self.sstable.read().unwrap().get(&key) {
-            Some(value) => Ok(Some(value)),
-            None => match self.levels.get(&key)? {
-                Some(value) => Ok(Some(value)),
-                None => Err(KvError::KeyNotFound(
-                    format!("Key {:?} could not be found", key).into(),
-                )),
-            },
-        }
-    }
-
-    fn remove(&self, key: String) -> crate::Result<()> {
-        self.remove(key)
     }
 }

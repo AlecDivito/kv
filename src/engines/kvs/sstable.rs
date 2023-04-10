@@ -3,7 +3,7 @@ use std::{
     fmt::Debug,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
 };
@@ -166,10 +166,10 @@ impl std::fmt::Display for MemoryTable {
     }
 }
 
-#[derive(Clone, Debug)]
 /// SSTable stores records in a sorted order that a user has submitted to be
 /// saved inside of the key value store. A write-ahead-log is also written to
 /// disk just in case the database goes offline during operation.
+#[derive(Clone, Debug)]
 pub struct SSTable {
     inner: MemoryTable,
     write_ahead_log: Arc<Mutex<BufWriter<File>>>,
@@ -179,9 +179,8 @@ pub struct SSTable {
 impl SSTable {
     /// Create a new SSTable and pass the directory in where a write-ahead-log
     /// should be created to save data on write.
-    pub fn new(directory: impl Into<PathBuf>) -> crate::Result<Self> {
-        let directory = directory.into();
-        let path = directory.join(format!("{}.redo", Uuid::new_v4()));
+    pub fn new(directory: impl AsRef<Path>) -> crate::Result<Self> {
+        let path = directory.as_ref().join(format!("{}.redo", Uuid::new_v4()));
         let writer = BufWriter::new(File::create(&path)?);
         Ok(Self {
             inner: MemoryTable::new(),

@@ -36,8 +36,6 @@ pub trait KvsEngine: Clone + Send + Sync {
     fn remove(&self, key: String) -> Result<()>;
 }
 
-mod sstable;
-
 /// kvs is this libraries implementation of a key value store
 pub mod kvs;
 

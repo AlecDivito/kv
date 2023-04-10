@@ -1,6 +1,5 @@
 use crate::common::{GetResponse, RemoveResponse, Request, SetResponse};
 use crate::{KvError, Result};
-use serde::Deserialize;
 use serde_json::de::IoRead;
 use serde_json::Deserializer;
 use std::io::{BufReader, BufWriter, Write};
@@ -25,10 +24,7 @@ impl KvClient {
 
     /// Get the value of a given key from the server.
     pub fn get(&mut self, key: String) -> Result<Option<String>> {
-        serde_json::to_writer(&mut self.writer, &Request::Get { key })?;
-        self.writer.flush()?;
-        let response = GetResponse::deserialize(&mut self.reader)?;
-        match response {
+        match self.write(&Request::Get { key })? {
             GetResponse::Ok(value) => Ok(value),
             GetResponse::Err(msg) => Err(KvError::StringError(msg.into())),
         }
@@ -36,10 +32,7 @@ impl KvClient {
 
     /// Set the value of a string key in the server.
     pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, &Request::Set { key, value })?;
-        self.writer.flush()?;
-        let response = SetResponse::deserialize(&mut self.reader)?;
-        match response {
+        match self.write(&Request::Set { key, value })? {
             SetResponse::Ok(_) => Ok(()),
             SetResponse::Err(msg) => Err(KvError::StringError(msg.into())),
         }
@@ -47,12 +40,20 @@ impl KvClient {
 
     /// Remove a value from the key value store
     pub fn remove(&mut self, key: String) -> Result<()> {
-        serde_json::to_writer(&mut self.writer, &Request::Remove { key })?;
-        self.writer.flush()?;
-        let resp = RemoveResponse::deserialize(&mut self.reader)?;
-        match resp {
+        match self.write(&Request::Remove { key })? {
             RemoveResponse::Ok(_) => Ok(()),
             RemoveResponse::Err(msg) => Err(KvError::StringError(msg.into())),
         }
+    }
+
+    fn write<T, R>(&mut self, t: &T) -> Result<R>
+    where
+        T: ?Sized + serde::Serialize,
+        R: serde::de::DeserializeOwned,
+    {
+        serde_json::to_writer(&mut self.writer, &t)?;
+        self.writer.flush()?;
+        let resp = R::deserialize(&mut self.reader)?;
+        Ok(resp)
     }
 }
