@@ -1,7 +1,6 @@
 use std::{
     ffi::OsStr,
-    path::PathBuf,
-    pin::Pin,
+    path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
@@ -42,9 +41,13 @@ impl std::fmt::Display for Storage {
 
 #[derive(Clone)]
 pub struct Level {
-    level: Pin<Box<usize>>,
-    directory: Pin<PathBuf>,
-    segments: Arc<RwLock<Vec<Storage>>>,
+    inner: Arc<RwLock<Lvl>>,
+}
+
+struct Lvl {
+    level: usize,
+    dir: PathBuf,
+    segments: Vec<Storage>,
 }
 
 impl Level {
@@ -83,9 +86,11 @@ impl Level {
 
         debug!("Level {} indices set {:?}", level, segments);
         Ok(Self {
-            directory: Pin::new(directory),
-            level: Pin::new(Box::new(level)),
-            segments: Arc::new(RwLock::new(segments)),
+            inner: Arc::new(RwLock::new(Lvl {
+                dir: directory,
+                level,
+                segments,
+            })),
         })
     }
 
@@ -95,30 +100,29 @@ impl Level {
     ///
     /// With the level having the correct state, it then tries to merge it's file
     /// if, and only if, it reaches the given threshold.
-    pub fn update_level(&self, next_path: impl Into<PathBuf>) -> crate::Result<Option<Segment>> {
-        let segments = self.segments.read().unwrap();
-        let length = segments.len();
-        if let Some((index, table)) = segments
+    pub fn update_level(&self, next_path: impl AsRef<Path>) -> crate::Result<Option<Segment>> {
+        let lock = self.inner.read().unwrap();
+        let length = lock.segments.len();
+        let level = lock.level;
+
+        if let Some((index, table)) = lock
+            .segments
             .iter()
             .enumerate()
             .find_map(|(u, s)| s.sstable().map(|t| (u, t)))
         {
-            let new_segment = table.save(self.directory.join(format!("{}.log", now())))?;
+            let new_segment = table.save(lock.dir.join(format!("{}.log", now())))?;
             trace!("Created new {} from {}", new_segment, table);
-            let length = segments.len();
-            drop(segments);
-            self.segments.write().unwrap()[index] = Storage::Segment(new_segment);
-            trace!(
-                "Level {} segments have been updated to {}",
-                self.level,
-                length
-            );
+            let length = lock.segments.len();
+            drop(lock);
+            self.inner.write().unwrap().segments[index] = Storage::Segment(new_segment);
+            trace!("Level {} segments have been updated to {}", level, length);
         } else {
-            drop(segments);
+            drop(lock);
         }
 
-        trace!("Level {}: Segments before merge {}", self.level, length);
-        Ok(if length > clamp(10 * (*self.level), 2) {
+        trace!("Level {}: Segments before merge {}", level, length);
+        Ok(if length > clamp(10 * level, 2) {
             let merge = self.merge(next_path)?;
             Some(merge)
         } else {
@@ -130,14 +134,14 @@ impl Level {
         trace!(
             "Adding {} to {:?}",
             storage,
-            self.segments.read().unwrap().len()
+            self.inner.read().unwrap().segments.len()
         );
-        self.segments.write().unwrap().push(storage);
+        self.inner.write().unwrap().segments.push(storage);
         Ok(())
     }
 
-    pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
-        for level in self.segments.read().unwrap().iter().rev() {
+    pub fn get(&self, key: &[u8]) -> crate::Result<Option<Vec<u8>>> {
+        for level in self.inner.read().unwrap().segments.iter().rev() {
             if let Some(value) = match level {
                 Storage::SSTable(s) => s.get(key),
                 Storage::Segment(s) => s.get(key)?,
@@ -148,11 +152,12 @@ impl Level {
         Ok(None)
     }
 
-    fn merge(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
-        let segment_path = path.into().join(format!("{}.log", now()));
+    fn merge(&self, path: impl AsRef<Path>) -> crate::Result<Segment> {
+        let segment_path = path.as_ref().join(format!("{}.log", now()));
         // get all of the relavent segments
-        let segments_lock = self.segments.read().unwrap();
-        let storage_segments = segments_lock
+        let lock = self.inner.read().unwrap();
+        let storage_segments = lock
+            .segments
             .iter()
             .enumerate()
             .filter(|(_, s)| s.segment().is_some())
@@ -165,17 +170,17 @@ impl Level {
             .collect();
         let mut indexies = storage_segments.iter().map(|i| i.0).collect::<Vec<usize>>();
         indexies.sort();
-        drop(segments_lock);
+        drop(lock);
 
         // attempt the merging processes
         let segment = Segment::from_segments(segment_path, segment_readers)?;
 
         // on successful compaction, remove the segments touched
-        let mut lock = self.segments.write().unwrap();
+        let mut lock = self.inner.write().unwrap();
         for index in indexies.iter().rev() {
-            if let Storage::Segment(segment) = lock.get_mut(*index).unwrap() {
+            if let Storage::Segment(segment) = lock.segments.get_mut(*index).unwrap() {
                 segment.mark_for_removal();
-                lock.remove(*index);
+                lock.segments.remove(*index);
             }
         }
         drop(lock);
@@ -264,7 +269,7 @@ impl Levels {
         }
     }
 
-    pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
+    pub fn get(&self, key: &[u8]) -> crate::Result<Option<Vec<u8>>> {
         let levels = self.inner.read().unwrap();
         for level in levels.iter() {
             if let Some(value) = level.get(key)? {

@@ -3,6 +3,7 @@ use std::{
     fmt::Debug,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    ops::Deref,
     path::{Path, PathBuf},
     pin::Pin,
     sync::{Arc, Mutex, RwLock},
@@ -15,16 +16,16 @@ use uuid::Uuid;
 use crate::common::now;
 use crate::datastructures::bloom::BloomFilter;
 
-#[derive(Default, Deserialize, Serialize, Debug)]
+#[derive(Clone, Default, Deserialize, Serialize, Debug)]
 pub struct Record {
     crc: u32,
     timestamp: u128,
-    key: String,
-    value: Option<String>,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
 }
 
 impl Record {
-    pub fn new(key: String, value: Option<String>) -> Self {
+    pub fn new(key: Vec<u8>, value: Option<Vec<u8>>) -> Self {
         let timestamp = now();
         let mut record = Self {
             crc: 0,
@@ -40,22 +41,17 @@ impl Record {
         let crc = Crc::<u32>::new(&CRC_32_ISCSI);
         let mut digest = crc.digest();
         digest.update(&self.timestamp.to_be_bytes());
-        digest.update(self.key.as_bytes());
-        digest.update(
-            self.value
-                .clone()
-                .unwrap_or(String::with_capacity(0))
-                .as_bytes(),
-        );
+        digest.update(&self.key);
+        digest.update(self.value.as_ref().unwrap_or(&vec![]));
         digest.finalize()
     }
 
-    pub fn key(&self) -> &str {
+    pub fn key(&self) -> &[u8] {
         &self.key
     }
 
-    pub fn value(&self) -> String {
-        self.value.clone().unwrap_or("".to_string())
+    pub fn value(&self) -> Option<&Vec<u8>> {
+        self.value.as_ref()
     }
 }
 
@@ -66,8 +62,11 @@ impl std::fmt::Display for Record {
             "Record({}, {}): {} -> {}",
             self.crc,
             self.timestamp,
-            self.key,
-            self.value.as_ref().unwrap_or(&"".to_string())
+            String::from_utf8_lossy(&self.key),
+            self.value
+                .as_ref()
+                .map(|v| String::from_utf8_lossy(v))
+                .unwrap_or("None".into())
         )
     }
 }
@@ -77,26 +76,29 @@ impl std::fmt::Display for Record {
 /// its place.
 #[derive(Clone, Debug)]
 struct MemoryTable {
-    inner: Arc<RwLock<BTreeMap<String, Option<String>>>>,
-    size: Arc<RwLock<usize>>,
+    inner: Arc<RwLock<MemTable>>,
+}
+
+#[derive(Clone, Debug)]
+struct MemTable {
+    map: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    size: usize,
 }
 
 impl MemoryTable {
     fn new() -> Self {
         Self {
-            inner: Arc::new(RwLock::new(BTreeMap::new())),
-            size: Arc::new(RwLock::new(0)),
+            inner: Arc::new(RwLock::new(MemTable {
+                map: BTreeMap::new(),
+                size: 0,
+            })),
         }
     }
 
-    fn from_write_ahead_log(path: impl Into<PathBuf>) -> crate::Result<Self> {
-        let path = path.into();
-        debug!("Building memory table from redo log {:?}", &path);
-        let table = Self {
-            inner: Arc::new(RwLock::new(BTreeMap::new())),
-            size: Arc::new(RwLock::new(0)),
-        };
-        let mut reader = BufReader::new(File::open(path)?);
+    fn from_write_ahead_log(path: impl AsRef<Path>) -> crate::Result<Self> {
+        debug!("Building memory table from redo log {:?}", &path.as_ref());
+        let table = Self::new();
+        let mut reader = BufReader::new(File::open(path.as_ref())?);
         while !reader.fill_buf().unwrap().is_empty() {
             let record: Record = bincode::deserialize_from(&mut reader).unwrap();
             if record.crc != record.calculate_crc() {
@@ -111,38 +113,41 @@ impl MemoryTable {
     }
 
     fn append(&self, record: Record) -> usize {
-        let mut size = self.size.write().unwrap();
-        let mut map = self.inner.write().unwrap();
-        trace!("Memory Size {}: Appending {}", size, &record);
-        let value_size = record.value().len();
+        let value_size = record.value().map(|v| v.len()).unwrap_or(0);
         let key_size = record.key.len();
-        *size = match map.insert(record.key, record.value) {
-            Some(old_value) => (*size - old_value.unwrap_or("".into()).len()) + value_size,
-            None => *size + key_size + value_size,
+        let mut lock = self.inner.write().unwrap();
+
+        trace!("Memory Size {}: Appending {}", lock.size, &record);
+
+        lock.size = match lock.map.insert(record.key, record.value) {
+            Some(old_value) => lock.size - old_value.map(|v| v.len()).unwrap_or(0) + value_size,
+            None => lock.size + key_size + value_size,
         };
-        *size
+        let size = lock.size;
+        drop(lock);
+        size
     }
 
-    fn get(&self, key: &str) -> Option<String> {
-        let map = self.inner.read().unwrap();
-        match map.get(key) {
+    fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        match self.inner.read().unwrap().map.get(key) {
             Some(value) => value.clone(),
             None => None,
         }
     }
 
-    fn drain_to_segment(&self, path: impl Into<PathBuf>) -> crate::Result<Segment> {
-        let segment_path = path.into();
-        debug!("Draining memory table to segment {:?}", segment_path);
+    /// Drain memory table to file and return it as a segment.
+    fn drain_to_segment(&self, path: impl AsRef<Path>) -> crate::Result<Segment> {
+        debug!("Draining memory table to segment {:?}", path.as_ref());
+
+        let mut writer = BufWriter::new(File::create(path.as_ref())?);
 
         let table = self.inner.read().unwrap();
-        let element_length = table.len();
-        let mut writer = BufWriter::new(File::create(&segment_path)?);
-        let mut size = writer.write(&element_length.to_be_bytes())?;
+        let number_of_records = table.map.len();
+        let mut index = Index::new(number_of_records);
+        let mut block_start = writer.write(&number_of_records.to_be_bytes())?;
+        let mut size = block_start;
 
-        let mut index = Index::new(element_length);
-        let mut block_start = size;
-        for (key, value) in table.iter() {
+        for (key, value) in table.map.iter() {
             let record = Record::new(key.clone(), value.clone());
             let bytes = bincode::serialize(&record)?;
             block_start += index.add(block_start, record)?;
@@ -150,18 +155,19 @@ impl MemoryTable {
         }
 
         drop(table);
-        self.inner.write().unwrap().clear();
-        Ok(Segment::new(index, &segment_path, size))
+
+        Ok(Segment::new(index, path.as_ref(), size))
     }
 }
 
 impl std::fmt::Display for MemoryTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let writer = self.inner.read().unwrap();
         write!(
             f,
             "MemoryTable(Size: {}, entries: {})",
-            self.size.read().unwrap(),
-            self.inner.read().unwrap().len()
+            writer.size,
+            writer.map.len()
         )
     }
 }
@@ -173,37 +179,35 @@ impl std::fmt::Display for MemoryTable {
 pub struct SSTable {
     inner: MemoryTable,
     write_ahead_log: Arc<Mutex<BufWriter<File>>>,
-    write_ahead_log_path: Pin<Box<PathBuf>>,
 }
 
 impl SSTable {
     /// Create a new SSTable and pass the directory in where a write-ahead-log
     /// should be created to save data on write.
     pub fn new(directory: impl AsRef<Path>) -> crate::Result<Self> {
+        info!("Creating new SSTable: {:?}.redo", directory.as_ref());
         let path = directory.as_ref().join(format!("{}.redo", Uuid::new_v4()));
-        let writer = BufWriter::new(File::create(&path)?);
+        let writer = BufWriter::new(File::create(path)?);
         Ok(Self {
             inner: MemoryTable::new(),
             write_ahead_log: Arc::new(Mutex::new(writer)),
-            write_ahead_log_path: Pin::new(Box::new(path)),
         })
     }
 
     /// Restore an SSTable from it's write-ahead-log.
-    pub fn from_write_ahead_log(path: impl Into<PathBuf>) -> crate::Result<Self> {
-        let path = path.into();
-        let inner = MemoryTable::from_write_ahead_log(&path)?;
-        let writer = BufWriter::new(File::create(&path)?);
+    pub fn from_write_ahead_log(path: impl AsRef<Path>) -> crate::Result<Self> {
+        info!("Restoring SSTable from: {:?}", path.as_ref());
+        let inner = MemoryTable::from_write_ahead_log(path.as_ref())?;
+        let writer = BufWriter::new(File::create(path.as_ref())?);
 
         Ok(Self {
             inner,
             write_ahead_log: Arc::new(Mutex::new(writer)),
-            write_ahead_log_path: Pin::new(Box::new(path)),
         })
     }
 
     /// Append a key value to the SSTable and write it to our log
-    pub fn append(&self, key: String, value: Option<String>) -> crate::Result<usize> {
+    pub fn append(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> crate::Result<usize> {
         let record = Record::new(key, value);
         let bytes = bincode::serialize(&record)?;
         let mut lock = self.write_ahead_log.lock().unwrap();
@@ -213,41 +217,37 @@ impl SSTable {
     }
 
     /// Check to see if a key exists inside of the SSTable
-    pub fn get(&self, key: &str) -> Option<String> {
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.inner.get(key)
     }
 
     /// Save the SSTable from memory onto disk as segment file. Return the path
     /// to the new segment file.
-    pub fn save(&self, segment_path: impl Into<PathBuf>) -> crate::Result<Segment> {
+    pub fn save(&self, segment_path: impl AsRef<Path>) -> crate::Result<Segment> {
         self.inner.drain_to_segment(segment_path)
     }
 }
 
 impl std::fmt::Display for SSTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "SSTable({}, {:?})",
-            self.inner, self.write_ahead_log_path
-        )
+        write!(f, "SSTable({})", self.inner)
     }
 }
 
 impl Drop for SSTable {
     fn drop(&mut self) {
-        let path = self.write_ahead_log_path.as_path();
-        trace!("Attempting to remove redo log {:?}", &path);
-        match std::fs::remove_file(path) {
-            Ok(_) => info!("Successfully removed redo log {:?}", &path),
-            Err(e) => error!("Failed to remove redo log {:?} with error {:?}", &path, e),
-        };
+        // let path = self.write_ahead_log_path.as_path();
+        // trace!("Attempting to remove redo log {:?}", &path);
+        // match std::fs::remove_file(path) {
+        //     Ok(_) => info!("Successfully removed redo log {:?}", &path),
+        //     Err(e) => error!("Failed to remove redo log {:?} with error {:?}", &path, e),
+        // };
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct BlockHint {
-    key: String,
+    key: Vec<u8>,
     number_of_elements: usize,
     block_size: u64,
     block_start: u64,
@@ -262,7 +262,7 @@ pub enum Compare {
 impl BlockHint {
     pub fn new(block_start: u64) -> Self {
         Self {
-            key: String::new(),
+            key: Vec::new(),
             number_of_elements: 0,
             block_size: 0,
             block_start,
@@ -270,7 +270,7 @@ impl BlockHint {
     }
 
     fn init_block(&mut self, record: Record, record_size: u64) {
-        self.key = record.key().to_string();
+        self.key = record.key().to_vec();
         self.block_size = record_size;
         self.number_of_elements = 1;
     }
@@ -297,10 +297,10 @@ impl BlockHint {
         Ok((record_size, next_block))
     }
 
-    pub fn compare(&self, key: &str) -> Compare {
+    pub fn compare(&self, key: &[u8]) -> Compare {
         if self.key == key {
             Compare::Equal
-        } else if self.key.as_str() < key {
+        } else if self.key.deref() < key {
             Compare::Higher
         } else {
             Compare::Lower
@@ -317,8 +317,8 @@ impl BlockHint {
     pub(crate) fn search_for(
         &self,
         segment_path: &Pin<PathBuf>,
-        key: &str,
-    ) -> crate::Result<Option<String>> {
+        key: &[u8],
+    ) -> crate::Result<Option<Vec<u8>>> {
         let mut reader = BufReader::new(File::open(segment_path.to_path_buf())?);
         reader.seek(SeekFrom::Start(self.block_start))?;
 
@@ -361,7 +361,7 @@ impl Index {
             error!("{} is corrupt (Actual {})", record, actual_crc);
             return Ok(bincode::serialized_size(&record)? as usize);
         }
-        self.filter.insert(record.key());
+        self.filter.insert(&String::from_utf8_lossy(record.key()));
         let block = match self.hints.last_mut() {
             Some(block) => block,
             None => {
@@ -378,15 +378,15 @@ impl Index {
         Ok(record_size as usize)
     }
 
-    pub fn get(&self, key: &str) -> Option<&BlockHint> {
-        if !self.filter.contains(key) {
+    pub fn get(&self, key: &[u8]) -> Option<&BlockHint> {
+        if !self.filter.contains(&String::from_utf8_lossy(key)) {
             None
         } else {
             Some(self.search(key))
         }
     }
 
-    fn search(&self, key: &str) -> &BlockHint {
+    fn search(&self, key: &[u8]) -> &BlockHint {
         let mut middle = self.hints.len() / 2;
         let mut hints = &self.hints[..];
         loop {
@@ -485,11 +485,10 @@ impl Segment {
             }
 
             // get all of the values from the readers
-            let mut records: Vec<&mut Option<Record>> = readers
-                .iter_mut()
-                .map(|r| &mut r.value)
-                .filter(|r| r.is_some())
-                .collect();
+            let mut records = readers
+                .iter()
+                .filter_map(|r| r.value.as_ref())
+                .collect::<Vec<_>>();
 
             // however, if there was no records left, then leave the loop
             if records.is_empty() {
@@ -497,14 +496,14 @@ impl Segment {
             }
 
             // sort by key so we have an ordered list from largest to smallest
-            records.sort_by_key(|f| f.as_ref().unwrap().key().to_string());
+            records.sort_by_key(|f| f.value.as_deref());
             records.reverse();
 
             // remove the first value and take all of the other keys that are equal to it
-            let mut groupped_records = vec![records.pop().unwrap().take().unwrap()];
+            let mut groupped_records = vec![records.pop().unwrap()];
             for record in records {
-                if record.as_ref().unwrap().key == groupped_records[0].key {
-                    groupped_records.push(record.take().unwrap());
+                if record.key == groupped_records[0].key {
+                    groupped_records.push(record);
                 }
             }
 
@@ -514,7 +513,7 @@ impl Segment {
 
             // write the record to our database
             let bytes = bincode::serialize(&writeable_record)?;
-            block_start += index.add(block_start, writeable_record)?;
+            block_start += index.add(block_start, writeable_record.clone())?;
             size += writer.write(&bytes)?;
             count += 1;
         }
@@ -526,10 +525,16 @@ impl Segment {
         Ok(Segment::new(index, segment_path, size))
     }
 
-    pub fn get(&self, key: &str) -> crate::Result<Option<String>> {
-        debug!("Searching for {} in {:?}", key, self.segment_path);
+    pub fn get(&self, key: &[u8]) -> crate::Result<Option<Vec<u8>>> {
+        debug!(
+            "Searching for {} in {:?}",
+            String::from_utf8_lossy(key),
+            self.segment_path
+        );
         if let Some(block_hint) = self.index.get(key) {
-            Ok(block_hint.search_for(&self.segment_path, key)?)
+            Ok(block_hint
+                .search_for(&self.segment_path, key)?
+                .map(|v| v.to_vec()))
         } else {
             Ok(None)
         }

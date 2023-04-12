@@ -8,7 +8,7 @@ const DEFAULT_LISTENING_ADDRESS: &str = "127.0.0.1";
 
 fn main() {
     let opt = App::new("kvs-client")
-        .version("1.0.0")
+        .version("0.1.0")
         .author("Alec Di Vito")
         .about("Access key value store server")
         .arg(

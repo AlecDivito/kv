@@ -10,17 +10,17 @@ fn get_stored_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
-    store.set("key2".to_owned(), "value2".to_owned())?;
+    store.set(b"key1".to_vec(), b"value1".to_vec())?;
+    store.set(b"key2".to_vec(), b"value2".to_vec())?;
 
-    assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
-    assert_eq!(store.get("key2".to_owned())?, Some("value2".to_owned()));
+    assert_eq!(store.get(b"key1")?, Some(b"value1".to_vec()));
+    assert_eq!(store.get(b"key2")?, Some(b"value2".to_vec()));
 
     // Open from disk again and check persistent data
     drop(store);
     let store = KvStore::open(temp_dir.path())?;
-    assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
-    assert_eq!(store.get("key2".to_owned())?, Some("value2".to_owned()));
+    assert_eq!(store.get(b"key1")?, Some(b"value1".to_vec()));
+    assert_eq!(store.get(b"key2")?, Some(b"value2".to_vec()));
 
     Ok(())
 }
@@ -31,17 +31,17 @@ fn overwrite_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, Some("value1".to_owned()));
-    store.set("key1".to_owned(), "value2".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, Some("value2".to_owned()));
+    store.set(b"key1".to_vec(), b"value1".to_vec())?;
+    assert_eq!(store.get(b"key1")?, Some(b"value1".to_vec()));
+    store.set(b"key1".to_vec(), b"value2".to_vec())?;
+    assert_eq!(store.get(b"key1")?, Some(b"value2".to_vec()));
 
     // Open from disk again and check persistent data
     drop(store);
     let store = KvStore::open(temp_dir.path())?;
-    assert_eq!(store.get("key1".to_owned())?, Some("value2".to_owned()));
-    store.set("key1".to_owned(), "value3".to_owned())?;
-    assert_eq!(store.get("key1".to_owned())?, Some("value3".to_owned()));
+    assert_eq!(store.get(b"key1")?, Some(b"value2".to_vec()));
+    store.set(b"key1".to_vec(), b"value3".to_vec())?;
+    assert_eq!(store.get(b"key1")?, Some(b"value3".to_vec()));
 
     Ok(())
 }
@@ -52,13 +52,13 @@ fn get_non_existent_value() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;
 
-    store.set("key1".to_owned(), "value1".to_owned())?;
-    assert_eq!(store.get("key2".to_owned())?, None);
+    store.set(b"key1".to_vec(), b"value1".to_vec())?;
+    assert_eq!(store.get(b"key2")?, None);
 
     // Open from disk again and check persistent data
     drop(store);
     let store = KvStore::open(temp_dir.path())?;
-    assert_eq!(store.get("key2".to_owned())?, None);
+    assert_eq!(store.get(b"key2")?, None);
 
     Ok(())
 }
@@ -67,7 +67,7 @@ fn get_non_existent_value() -> Result<()> {
 fn remove_non_existent_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;
-    assert!(store.remove("key1".to_owned()).is_err());
+    assert!(store.remove(b"key1".to_vec()).is_err());
     Ok(())
 }
 
@@ -75,9 +75,9 @@ fn remove_non_existent_key() -> Result<()> {
 fn remove_key() -> Result<()> {
     let temp_dir = TempDir::new().expect("unable to create temporary working directory");
     let store = KvStore::open(temp_dir.path())?;
-    store.set("key1".to_owned(), "value1".to_owned())?;
-    assert!(store.remove("key1".to_owned()).is_ok());
-    assert_eq!(store.get("key1".to_owned())?, None);
+    store.set(b"key1".to_vec(), b"value1".to_vec())?;
+    assert!(store.remove(b"key1".to_vec()).is_ok());
+    assert_eq!(store.get(b"key1")?, None);
     Ok(())
 }
 
@@ -102,8 +102,8 @@ fn compaction() -> Result<()> {
     let mut current_size = dir_size();
     for iter in 0..1000 {
         for key_id in 0..1000 {
-            let key = format!("key{}", key_id);
-            let value = format!("{}", iter);
+            let key = format!("key{}", key_id).into_bytes();
+            let value = format!("{}", iter).into_bytes();
             store.set(key, value)?;
         }
 
@@ -118,8 +118,8 @@ fn compaction() -> Result<()> {
         // reopen and check content
         let store = KvStore::open(temp_dir.path())?;
         for key_id in 0..1000 {
-            let key = format!("key{}", key_id);
-            assert_eq!(store.get(key)?, Some(format!("{}", iter)));
+            let key = format!("key{}", key_id).into_bytes();
+            assert_eq!(store.get(&key)?.unwrap(), format!("{}", iter).into_bytes());
         }
         return Ok(());
     }
@@ -137,7 +137,10 @@ fn concurrent_set() -> Result<()> {
         let barrier = barrier.clone();
         thread::spawn(move || {
             store
-                .set(format!("key{}", i), format!("value{}", i))
+                .set(
+                    format!("key{}", i).into_bytes(),
+                    format!("value{}", i).into_bytes(),
+                )
                 .unwrap();
             barrier.wait();
         });
@@ -145,14 +148,20 @@ fn concurrent_set() -> Result<()> {
     barrier.wait();
 
     for i in 0..1000 {
-        assert_eq!(store.get(format!("key{}", i))?, Some(format!("value{}", i)));
+        assert_eq!(
+            store.get(format!("key{}", i).as_bytes())?,
+            Some(format!("value{}", i).into_bytes())
+        );
     }
 
     // Open from disk again and check persistent data
     drop(store);
     let store = KvStore::open(temp_dir.path())?;
     for i in 0..1000 {
-        assert_eq!(store.get(format!("key{}", i))?, Some(format!("value{}", i)));
+        assert_eq!(
+            store.get(format!("key{}", i).as_bytes())?,
+            Some(format!("value{}", i).into_bytes())
+        );
     }
 
     Ok(())
@@ -164,7 +173,10 @@ fn concurrent_get() -> Result<()> {
     let store = KvStore::open(temp_dir.path())?;
     for i in 0..100 {
         store
-            .set(format!("key{}", i), format!("value{}", i))
+            .set(
+                format!("key{}", i).into_bytes(),
+                format!("value{}", i).into_bytes(),
+            )
             .unwrap();
     }
 
@@ -175,8 +187,8 @@ fn concurrent_get() -> Result<()> {
             for i in 0..100 {
                 let key_id = (i + thread_id) % 100;
                 assert_eq!(
-                    store.get(format!("key{}", key_id)).unwrap(),
-                    Some(format!("value{}", key_id))
+                    store.get(format!("key{}", key_id).as_bytes()).unwrap(),
+                    Some(format!("value{}", key_id).into_bytes())
                 );
             }
         });
@@ -196,8 +208,8 @@ fn concurrent_get() -> Result<()> {
             for i in 0..100 {
                 let key_id = (i + thread_id) % 100;
                 assert_eq!(
-                    store.get(format!("key{}", key_id)).unwrap(),
-                    Some(format!("value{}", key_id))
+                    store.get(format!("key{}", key_id).as_bytes()).unwrap(),
+                    Some(format!("value{}", key_id).into_bytes())
                 );
             }
         });

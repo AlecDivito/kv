@@ -19,7 +19,7 @@ pub struct KvStore {
 }
 
 impl KvStore {
-    fn write(&self, key: String, value: Option<String>) -> crate::Result<()> {
+    fn write(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> crate::Result<()> {
         let new_size = self.sstable.read().unwrap().append(key, value)?;
 
         if new_size > 256 * 1000 * 1000 {
@@ -42,12 +42,12 @@ impl KvStore {
     }
 
     /// Add a value to our key value store
-    pub fn add(&self, key: String, value: String) -> crate::Result<()> {
+    pub fn add(&self, key: Vec<u8>, value: Vec<u8>) -> crate::Result<()> {
         self.write(key, Some(value))
     }
 
     /// remove a value from our key value store
-    pub fn remove(&self, key: String) -> crate::Result<()> {
+    pub fn remove(&self, key: Vec<u8>) -> crate::Result<()> {
         self.write(key, None)
     }
 }
@@ -98,14 +98,14 @@ impl KvsEngine for KvStore {
         })
     }
 
-    fn set(&self, key: String, value: String) -> crate::Result<()> {
+    fn set(&self, key: Vec<u8>, value: Vec<u8>) -> crate::Result<()> {
         self.add(key, value)
     }
 
-    fn get(&self, key: String) -> crate::Result<Option<String>> {
-        match self.sstable.read().unwrap().get(&key) {
+    fn get(&self, key: &[u8]) -> crate::Result<Option<Vec<u8>>> {
+        match self.sstable.read().unwrap().get(key) {
             Some(value) => Ok(Some(value)),
-            None => match self.levels.get(&key)? {
+            None => match self.levels.get(key)? {
                 Some(value) => Ok(Some(value)),
                 None => Err(KvError::KeyNotFound(
                     format!("Key {:?} could not be found", key).into(),
@@ -114,7 +114,7 @@ impl KvsEngine for KvStore {
         }
     }
 
-    fn remove(&self, key: String) -> crate::Result<()> {
+    fn remove(&self, key: Vec<u8>) -> crate::Result<()> {
         self.remove(key)
     }
 }

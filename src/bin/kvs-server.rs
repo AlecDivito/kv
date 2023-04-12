@@ -43,7 +43,7 @@ impl std::fmt::Display for Engine {
 fn main() {
     env_logger::builder().filter_level(LevelFilter::Info).init();
     let opt = App::new("kvs-server")
-        .version("1.0.0")
+        .version("0.1.0")
         .author("Alec Di Vito")
         .about("Key value store server")
         .arg(

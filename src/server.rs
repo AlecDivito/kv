@@ -56,18 +56,27 @@ impl<E: KvsEngine> KvServer<E> {
             let req = req?;
             info!("Receive request from {}: {:?}", peer_addr, req);
             match req {
-                Request::Get { key } => send_response!(match self.engine.get(key) {
-                    Ok(v) => GetResponse::Ok(v),
+                Request::Get { key } => send_response!(match self.engine.get(key.as_bytes()) {
+                    Ok(Some(v)) => match String::from_utf8(v) {
+                        Ok(v) => GetResponse::Ok(Some(v)),
+                        Err(e) => GetResponse::Err(format!("{}", e)),
+                    },
+                    Ok(None) => GetResponse::Ok(None),
                     Err(e) => GetResponse::Err(format!("{}", e)),
                 }),
-                Request::Set { key, value } => send_response!(match self.engine.set(key, value) {
+                Request::Set { key, value } => send_response!(match self
+                    .engine
+                    .set(key.as_bytes().to_vec(), value.as_bytes().to_vec())
+                {
                     Ok(_) => SetResponse::Ok(()),
                     Err(e) => SetResponse::Err(format!("{}", e)),
                 }),
-                Request::Remove { key } => send_response!(match self.engine.remove(key) {
-                    Ok(_) => RemoveResponse::Ok(()),
-                    Err(e) => RemoveResponse::Err(format!("{}", e)),
-                }),
+                Request::Remove { key } => {
+                    send_response!(match self.engine.remove(key.as_bytes().to_vec()) {
+                        Ok(_) => RemoveResponse::Ok(()),
+                        Err(e) => RemoveResponse::Err(format!("{}", e)),
+                    })
+                }
             }
         }
 

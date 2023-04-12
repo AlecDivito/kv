@@ -18,7 +18,7 @@ pub trait KvsEngine: Clone + Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the value is not written successfully
-    fn set(&self, key: String, value: String) -> Result<()>;
+    fn set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()>;
 
     /// Gets the string value of a given string key.
     /// Returns `None` if the given key does not exist.
@@ -26,14 +26,14 @@ pub trait KvsEngine: Clone + Send + Sync {
     /// # Errors
     ///
     /// Return an error if the value is not read successfullly
-    fn get(&self, key: String) -> Result<Option<String>>;
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Removes a given key.
     ///
     /// # Errors
     ///
     /// Return an error if the key does not exist or value failed to be read
-    fn remove(&self, key: String) -> Result<()>;
+    fn remove(&self, key: Vec<u8>) -> Result<()>;
 }
 
 /// kvs is this libraries implementation of a key value store
