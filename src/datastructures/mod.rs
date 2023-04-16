@@ -2,3 +2,4 @@
 //! database.
 
 pub mod bloom;
+pub mod matcher;

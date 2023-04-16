@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Request {
     Get { key: String },
+    Find { pattern: String },
     Set { key: String, value: String },
     Remove { key: String },
 }
@@ -24,6 +25,12 @@ pub enum SetResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RemoveResponse {
     Ok(()),
+    Err(String),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum FindResponse {
+    Ok(Vec<Vec<u8>>),
     Err(String),
 }
 

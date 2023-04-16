@@ -114,6 +114,11 @@ impl KvsEngine for KvStore {
         }
     }
 
+    fn find(&self, key: Vec<u8>) -> crate::Result<Vec<Vec<u8>>> {
+        todo!()
+        // self.levels
+    }
+
     fn remove(&self, key: Vec<u8>) -> crate::Result<()> {
         self.remove(key)
     }

@@ -29,6 +29,10 @@ impl KvsEngine for SledKvsEngine {
         // .transpose()
     }
 
+    fn find(&self, _like: Vec<u8>) -> Result<Vec<Vec<u8>>> {
+        todo!()
+    }
+
     fn remove(&self, key: Vec<u8>) -> Result<()> {
         let tree: &Tree = &self.0;
         tree.remove(key)?

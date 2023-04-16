@@ -1,4 +1,4 @@
-use crate::common::{GetResponse, RemoveResponse, Request, SetResponse};
+use crate::common::{FindResponse, GetResponse, RemoveResponse, Request, SetResponse};
 use crate::{KvError, Result};
 use serde_json::de::IoRead;
 use serde_json::Deserializer;
@@ -35,6 +35,19 @@ impl KvClient {
         match self.write(&Request::Set { key, value })? {
             SetResponse::Ok(_) => Ok(()),
             SetResponse::Err(msg) => Err(KvError::StringError(msg.into())),
+        }
+    }
+
+    /// Find a list of keys given a pattern from the server.
+    pub fn find(&mut self, pattern: String) -> Result<Vec<String>> {
+        match self.write(&Request::Find { pattern })? {
+            FindResponse::Ok(mut list) => Ok(list
+                .drain(..)
+                .map(|b| {
+                    String::from_utf8(b).unwrap_or_else(|err| format!("<from_utf8_error> {}", err))
+                })
+                .collect::<Vec<_>>()),
+            FindResponse::Err(err) => Err(KvError::StringError(err.into())),
         }
     }
 

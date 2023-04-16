@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::KvsEngine;
+use crate::{datastructures::matcher::prepare, KvsEngine};
 
 /// Key value store that keeps all data in memory
 #[derive(Clone)]
@@ -28,6 +28,20 @@ impl KvsEngine for KvInMemoryStore {
 
     fn get(&self, key: &[u8]) -> crate::Result<Option<Vec<u8>>> {
         Ok(self.map.read().unwrap().get(key).map(Clone::clone))
+    }
+
+    fn find(&self, like: Vec<u8>) -> crate::Result<Vec<Vec<u8>>> {
+        let mut keys = vec![];
+        let tester = prepare(like);
+        let read = self.map.read().unwrap();
+
+        for key in read.keys() {
+            if tester.test(key) {
+                keys.push(key.to_vec());
+            }
+        }
+
+        Ok(keys)
     }
 
     fn remove(&self, key: Vec<u8>) -> crate::Result<()> {

@@ -34,6 +34,13 @@ pub trait KvsEngine: Clone + Send + Sync {
     ///
     /// Return an error if the key does not exist or value failed to be read
     fn remove(&self, key: Vec<u8>) -> Result<()>;
+
+    /// Find a collection of key values.
+    ///
+    /// # Errors
+    ///
+    /// Return an error if we failed to complete the read of the keys
+    fn find(&self, like: Vec<u8>) -> Result<Vec<Vec<u8>>>;
 }
 
 /// kvs is this libraries implementation of a key value store

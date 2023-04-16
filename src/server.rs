@@ -5,7 +5,7 @@ use std::{
 
 use serde_json::Deserializer;
 
-use crate::error::Result;
+use crate::{common::FindResponse, error::Result};
 use crate::{
     common::{GetResponse, RemoveResponse, Request, SetResponse},
     KvsEngine,
@@ -64,6 +64,12 @@ impl<E: KvsEngine> KvServer<E> {
                     Ok(None) => GetResponse::Ok(None),
                     Err(e) => GetResponse::Err(format!("{}", e)),
                 }),
+                Request::Find { pattern } => {
+                    send_response!(match self.engine.find(pattern.as_bytes().to_vec()) {
+                        Ok(list) => FindResponse::Ok(list),
+                        Err(e) => FindResponse::Err(format!("{}", e)),
+                    })
+                }
                 Request::Set { key, value } => send_response!(match self
                     .engine
                     .set(key.as_bytes().to_vec(), value.as_bytes().to_vec())
