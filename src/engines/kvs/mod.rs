@@ -53,7 +53,7 @@ impl KvStore {
 }
 
 impl KvsEngine for KvStore {
-    fn open(folder: impl Into<PathBuf>) -> crate::Result<Self>
+    fn restore(folder: impl Into<PathBuf>) -> crate::Result<Self>
     where
         Self: Sized,
     {

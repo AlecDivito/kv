@@ -27,7 +27,7 @@ impl Default for KvInMemoryStore {
 }
 
 impl KvsEngine for KvInMemoryStore {
-    fn open(_: impl Into<std::path::PathBuf>) -> crate::Result<Self>
+    fn restore(_: impl Into<std::path::PathBuf>) -> crate::Result<Self>
     where
         Self: Sized,
     {

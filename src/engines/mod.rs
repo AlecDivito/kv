@@ -8,7 +8,7 @@ use crate::Result;
 /// Trait for a key value storage engine
 pub trait KvsEngine: Clone + Send + Sync {
     /// Build a Kvstore from a database folder
-    fn open(folder: impl Into<PathBuf>) -> Result<Self>
+    fn restore(folder: impl Into<PathBuf>) -> Result<Self>
     where
         Self: Sized;
 

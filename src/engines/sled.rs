@@ -9,7 +9,7 @@ use sled::{open, Db, Tree};
 pub struct SledKvsEngine(Db);
 
 impl KvsEngine for SledKvsEngine {
-    fn open(folder: impl Into<PathBuf>) -> Result<SledKvsEngine> {
+    fn restore(folder: impl Into<PathBuf>) -> Result<SledKvsEngine> {
         Ok(SledKvsEngine(open(folder.into())?))
     }
 

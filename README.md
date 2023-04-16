@@ -24,8 +24,8 @@ kvs -V
 The kvs also contains a library to give you programmatic access to the tool.
 
 ```rust
-// Open the KvStore at a given path. Return the KvStore.
-KvStore::open(path: impl Into<PathBuf>) -> Result<KvStore>
+// Restore the KvStore at a given path. Return the KvStore.
+KvStore::restore(path: impl Into<PathBuf>) -> Result<KvStore>
 
 // Set the value of a string key to a string. Return an error if the value is not written successfully.
 KvStore::set(&self, key: Vec<u8>, value: Vec<u8>) -> Result<()>

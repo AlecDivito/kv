@@ -91,9 +91,9 @@ fn run(engine: Engine, address: &str, port: &str) -> Result<()> {
     let ip = SocketAddr::new(IpAddr::from_str(address).unwrap(), port.parse().unwrap());
 
     match engine {
-        Engine::Kvs => run_with_engine(KvStore::open("./.temp")?, ip)?,
-        Engine::Sled => run_with_engine(SledKvsEngine::open(current_dir()?.as_path())?, ip)?,
-        Engine::Memory => run_with_engine(KvInMemoryStore::open("").unwrap(), ip)?,
+        Engine::Kvs => run_with_engine(KvStore::restore("./.temp")?, ip)?,
+        Engine::Sled => run_with_engine(SledKvsEngine::restore(current_dir()?.as_path())?, ip)?,
+        Engine::Memory => run_with_engine(KvInMemoryStore::restore("").unwrap(), ip)?,
     };
 
     Ok(())
