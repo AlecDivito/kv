@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt::Debug,
     fs::File,
     io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -13,8 +13,8 @@ use crc::{Crc, CRC_32_ISCSI};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::common::now;
 use crate::datastructures::bloom::BloomFilter;
+use crate::{common::now, datastructures::matcher::PreparedPattern};
 
 #[derive(Clone, Default, Deserialize, Serialize, Debug)]
 pub struct Record {
@@ -135,6 +135,16 @@ impl MemoryTable {
         }
     }
 
+    fn find(&self, pattern: &PreparedPattern) -> Vec<Vec<u8>> {
+        let mut keys = vec![];
+        for key in self.inner.read().unwrap().map.keys() {
+            if pattern.test(key) {
+                keys.push(key.clone());
+            }
+        }
+        keys
+    }
+
     /// Drain memory table to file and return it as a segment.
     fn drain_to_segment(&self, path: impl AsRef<Path>) -> crate::Result<Segment> {
         debug!("Draining memory table to segment {:?}", path.as_ref());
@@ -219,6 +229,10 @@ impl SSTable {
     /// Check to see if a key exists inside of the SSTable
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.inner.get(key)
+    }
+
+    pub fn find(&self, pattern: &PreparedPattern) -> Vec<Vec<u8>> {
+        self.inner.find(pattern)
     }
 
     /// Save the SSTable from memory onto disk as segment file. Return the path
@@ -314,9 +328,35 @@ impl BlockHint {
             + self.block_start.to_be_bytes().len()
     }
 
+    pub(crate) fn find_keys(
+        blocks: &mut [&Self],
+        segment_path: Pin<PathBuf>,
+        pattern: &PreparedPattern,
+    ) -> crate::Result<Vec<Vec<u8>>> {
+        if blocks.is_empty() {
+            return Ok(vec![]);
+        }
+        blocks.sort_by(|a, b| a.block_start.cmp(&b.block_start));
+        let mut reader = BufReader::new(File::open(segment_path.to_path_buf())?);
+        let mut keys = vec![];
+
+        for block in blocks.iter() {
+            reader.seek(SeekFrom::Start(block.block_start))?;
+            if reader.fill_buf().unwrap().is_empty() {
+                return Ok(keys);
+            }
+            let record: Record = bincode::deserialize_from(&mut reader)?;
+            if pattern.test(&record.key) {
+                keys.push(record.key.clone());
+            }
+        }
+
+        Ok(keys)
+    }
+
     pub(crate) fn search_for(
         &self,
-        segment_path: &Pin<PathBuf>,
+        segment_path: Pin<PathBuf>,
         key: &[u8],
     ) -> crate::Result<Option<Vec<u8>>> {
         let mut reader = BufReader::new(File::open(segment_path.to_path_buf())?);
@@ -384,6 +424,16 @@ impl Index {
         } else {
             Some(self.search(key))
         }
+    }
+
+    fn find(&self, pattern: &PreparedPattern) -> Vec<&BlockHint> {
+        let mut hints = vec![];
+        for hint in self.hints.iter() {
+            if pattern.test(&hint.key) {
+                hints.push(hint);
+            }
+        }
+        hints
     }
 
     fn search(&self, key: &[u8]) -> &BlockHint {
@@ -532,12 +582,25 @@ impl Segment {
             self.segment_path
         );
         if let Some(block_hint) = self.index.get(key) {
-            Ok(block_hint
-                .search_for(&self.segment_path, key)?
-                .map(|v| v.to_vec()))
+            Ok(block_hint.search_for(self.segment_path.clone(), key)?)
         } else {
             Ok(None)
         }
+    }
+
+    pub fn find(&self, pattern: &PreparedPattern) -> crate::Result<Vec<Vec<u8>>> {
+        debug!(
+            "Finding keys that match {:?} in {:?}",
+            pattern, self.segment_path
+        );
+        let mut set = HashSet::new();
+        let mut hints = self.index.find(pattern);
+        let keys = BlockHint::find_keys(&mut hints, self.segment_path.clone(), pattern)?;
+        for key in keys {
+            set.insert(key);
+        }
+        let set = set.into_iter().collect::<Vec<_>>();
+        Ok(set)
     }
 
     pub fn mark_for_removal(&mut self) {

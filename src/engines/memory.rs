@@ -11,6 +11,21 @@ pub struct KvInMemoryStore {
     map: Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
 }
 
+impl KvInMemoryStore {
+    /// Create a new in memory key value store
+    pub fn new() -> Self {
+        Self {
+            map: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+}
+
+impl Default for KvInMemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KvsEngine for KvInMemoryStore {
     fn open(_: impl Into<std::path::PathBuf>) -> crate::Result<Self>
     where
@@ -47,5 +62,28 @@ impl KvsEngine for KvInMemoryStore {
     fn remove(&self, key: Vec<u8>) -> crate::Result<()> {
         let _ = self.map.write().unwrap().remove(&key);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{KvInMemoryStore, KvsEngine};
+
+    #[test]
+    fn find_keys() {
+        let kv = KvInMemoryStore::new();
+        let test_keys = vec![
+            b"that".to_vec(),
+            b"them".to_vec(),
+            b"this".to_vec(),
+            b"those".to_vec(),
+            b"thought".to_vec(),
+        ];
+        for (index, key) in test_keys.iter().enumerate() {
+            kv.set(key.clone(), format!("value{}", index).into_bytes())
+                .unwrap();
+        }
+        let keys = kv.find(b"th*".to_vec()).unwrap();
+        assert_eq!(keys, test_keys);
     }
 }

@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use crate::{KvError, KvsEngine};
+use crate::{datastructures::matcher::prepare, KvError, KvsEngine};
 
 use self::{level::Levels, sstable::SSTable};
 
@@ -115,8 +115,13 @@ impl KvsEngine for KvStore {
     }
 
     fn find(&self, key: Vec<u8>) -> crate::Result<Vec<Vec<u8>>> {
-        todo!()
-        // self.levels
+        let pattern = prepare(key);
+        let recent_keys = self.sstable.read().unwrap().find(&pattern);
+        let mut keys = self.levels.find(&pattern)?;
+        for key in recent_keys {
+            keys.insert(key);
+        }
+        Ok(keys.into_iter().collect::<Vec<_>>())
     }
 
     fn remove(&self, key: Vec<u8>) -> crate::Result<()> {

@@ -1,10 +1,11 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
 };
 
-use crate::common::now;
+use crate::{common::now, datastructures::matcher::PreparedPattern};
 
 use super::sstable::{SSTable, Segment, SegmentReader};
 
@@ -152,6 +153,21 @@ impl Level {
         Ok(None)
     }
 
+    pub fn find(&self, pattern: &PreparedPattern) -> crate::Result<Vec<Vec<u8>>> {
+        let mut keys = std::collections::HashSet::new();
+        for level in self.inner.read().unwrap().segments.iter().rev() {
+            let new_keys = match level {
+                Storage::SSTable(s) => s.find(pattern),
+                Storage::Segment(s) => s.find(pattern)?,
+            };
+            for key in new_keys {
+                keys.insert(key);
+            }
+        }
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        Ok(keys)
+    }
+
     fn merge(&self, path: impl AsRef<Path>) -> crate::Result<Segment> {
         let segment_path = path.as_ref().join(format!("{}.log", now()));
         // get all of the relavent segments
@@ -277,6 +293,17 @@ impl Levels {
             }
         }
         Ok(None)
+    }
+
+    pub fn find(&self, pattern: &PreparedPattern) -> crate::Result<HashSet<Vec<u8>>> {
+        let mut keys = HashSet::new();
+        let levels = self.inner.read().unwrap();
+        for level in levels.iter() {
+            for new_key in level.find(pattern)? {
+                keys.insert(new_key);
+            }
+        }
+        Ok(keys)
     }
 
     pub fn add_table(&self, sstable: SSTable) -> crate::Result<()> {

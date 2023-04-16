@@ -1,9 +1,11 @@
+#[derive(Debug)]
 enum Test {
     Exact(u8),
     Wildcard,
     Until(Option<u8>),
 }
 
+#[derive(Debug)]
 pub struct PreparedPattern {
     tests: Vec<Test>,
 }
@@ -98,5 +100,11 @@ mod tests {
         assert!(prepare.test(b"that really is amazing"));
         assert!(prepare.test(b"them peppers is something"));
         assert!(prepare.test(b"thou  is crazying"))
+    }
+
+    #[test]
+    fn match_complex_any_pattern() {
+        let prepare = prepare(b"*82__".to_vec());
+        assert!(prepare.test(b"Key8200"));
     }
 }

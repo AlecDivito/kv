@@ -30,11 +30,20 @@ fn main() {
         )
         .subcommand(
             App::new("set")
-                .about("Set the value of a string key to a string")
+                .about("Set the value of ad string key to a string")
                 .arg(Arg::with_name("key").help("A string key").required(true))
                 .arg(
                     Arg::with_name("value")
                         .help("The string vallue of the key")
+                        .required(true),
+                ),
+        )
+        .subcommand(
+            App::new("find")
+                .about("Find keys that match a pattern")
+                .arg(
+                    Arg::with_name("pattern")
+                        .help("A string that matches a pattern")
                         .required(true),
                 ),
         )
@@ -71,13 +80,23 @@ fn run(opt: ArgMatches) -> Result<()> {
             }
         }
         ("set", Some(sub)) => {
-            client.set(
-                sub.value_of("key").unwrap().to_string(),
-                sub.value_of("value").unwrap().to_string(),
-            )?;
+            let key = sub.value_of("key").unwrap().to_string();
+            let value = sub.value_of("value").unwrap().to_string();
+            client.set(key.clone(), value.clone())?;
+            println!("Set {} to {}", key, value);
         }
         ("rm", Some(sub)) => {
-            client.remove(sub.value_of("key").unwrap().to_string())?;
+            let key = sub.value_of("key").unwrap().to_string();
+            client.remove(key.clone())?;
+            println!("Removed {}", key);
+        }
+        ("find", Some(sub)) => {
+            let pattern = sub.value_of("pattern").unwrap().to_string();
+            let keys = client.find(pattern.clone())?;
+            println!("For Pattern {}, Found:", pattern);
+            for key in keys {
+                println!("{}", key);
+            }
         }
         ("test", Some(sub)) => {
             let operation = match sub.value_of("operation") {
