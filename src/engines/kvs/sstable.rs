@@ -189,6 +189,7 @@ impl std::fmt::Display for MemoryTable {
 pub struct SSTable {
     inner: MemoryTable,
     write_ahead_log: Arc<Mutex<BufWriter<File>>>,
+    write_ahead_log_path: PathBuf,
 }
 
 impl SSTable {
@@ -201,6 +202,7 @@ impl SSTable {
         Ok(Self {
             inner: MemoryTable::new(),
             write_ahead_log: Arc::new(Mutex::new(writer)),
+            write_ahead_log_path: directory.as_ref().to_path_buf(),
         })
     }
 
@@ -213,6 +215,7 @@ impl SSTable {
         Ok(Self {
             inner,
             write_ahead_log: Arc::new(Mutex::new(writer)),
+            write_ahead_log_path: path.as_ref().to_path_buf(),
         })
     }
 
@@ -250,12 +253,12 @@ impl std::fmt::Display for SSTable {
 
 impl Drop for SSTable {
     fn drop(&mut self) {
-        // let path = self.write_ahead_log_path.as_path();
-        // trace!("Attempting to remove redo log {:?}", &path);
-        // match std::fs::remove_file(path) {
-        //     Ok(_) => info!("Successfully removed redo log {:?}", &path),
-        //     Err(e) => error!("Failed to remove redo log {:?} with error {:?}", &path, e),
-        // };
+        let path = self.write_ahead_log_path.as_path();
+        trace!("Attempting to remove redo log {:?}", &path);
+        match std::fs::remove_file(path) {
+            Ok(_) => info!("Successfully removed redo log {:?}", &path),
+            Err(e) => error!("Failed to remove redo log {:?} with error {:?}", &path, e),
+        };
     }
 }
 

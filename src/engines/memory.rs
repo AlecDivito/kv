@@ -1,14 +1,17 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, RwLock},
+    sync::{mpsc, Arc, RwLock},
 };
 
 use crate::{datastructures::matcher::prepare, KvsEngine};
+
+use super::{Subscriber, UpdateResult};
 
 /// Key value store that keeps all data in memory
 #[derive(Clone)]
 pub struct KvInMemoryStore {
     map: Arc<RwLock<BTreeMap<Vec<u8>, Vec<u8>>>>,
+    subscribers: Arc<RwLock<Vec<Arc<Subscriber>>>>,
 }
 
 impl KvInMemoryStore {
@@ -16,6 +19,7 @@ impl KvInMemoryStore {
     pub fn new() -> Self {
         Self {
             map: Arc::new(RwLock::new(BTreeMap::new())),
+            subscribers: Arc::new(RwLock::new(Vec::new())),
         }
     }
 }
@@ -31,9 +35,7 @@ impl KvsEngine for KvInMemoryStore {
     where
         Self: Sized,
     {
-        Ok(Self {
-            map: Arc::new(RwLock::new(Default::default())),
-        })
+        Ok(Self::new())
     }
 
     fn set(&self, key: Vec<u8>, value: Vec<u8>) -> crate::Result<()> {
@@ -61,6 +63,11 @@ impl KvsEngine for KvInMemoryStore {
 
     fn remove(&self, key: Vec<u8>) -> crate::Result<()> {
         let _ = self.map.write().unwrap().remove(&key);
+        Ok(())
+    }
+
+    fn subscribe(&self, subscriber: Subscriber) -> crate::Result<()> {
+        self.subscribers.write().unwrap().push(subscriber);
         Ok(())
     }
 }
