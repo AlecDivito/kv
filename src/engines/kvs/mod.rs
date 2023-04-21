@@ -5,29 +5,46 @@ use std::{
 
 use crate::{datastructures::matcher::prepare, KvError, KvsEngine};
 
-use self::{level::Levels, sstable::SSTable};
+use self::{config::Config, level::Levels, sstable::SSTable};
 
+mod config;
 mod level;
 mod sstable;
 
 /// KvStore stores all the data for the kvstore
 #[derive(Clone)]
 pub struct KvStore {
-    directory: Arc<PathBuf>,
+    config: Arc<Config>,
     sstable: Arc<RwLock<SSTable>>,
     levels: Levels,
 }
 
 impl KvStore {
+    /// Create or restore a key value store. Given a folder location.
+    pub fn new(folder: impl Into<PathBuf>) -> crate::Result<Self> {
+        let config = Config::new(folder);
+        config.init()?;
+        let sstable = config.restore_wal()?;
+        let levels = config.restore_levels()?;
+
+        info!("State read, application ready for requests");
+
+        Ok(Self {
+            config: Arc::new(config),
+            sstable: Arc::new(RwLock::new(sstable)),
+            levels,
+        })
+    }
+
     fn write(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> crate::Result<()> {
         let new_size = self.sstable.read().unwrap().append(key, value)?;
 
-        if new_size > 256 * 1000 * 1000 {
+        if self.config.should_rotate_wal(new_size) {
             // sstable is too large, rotate
-            let new_sstable = SSTable::new(&*self.directory)?;
             let mut sstable = self.sstable.write().unwrap();
-            let old_sstable = std::mem::replace(&mut *sstable, new_sstable);
+            let old_sstable = self.config.replace_wal_inplace(&mut sstable)?;
             drop(sstable);
+
             self.levels.add_table(old_sstable)?;
             let levels = self.levels.clone();
             std::thread::spawn(move || {
@@ -57,45 +74,7 @@ impl KvsEngine for KvStore {
     where
         Self: Sized,
     {
-        let directory: PathBuf = folder.into();
-        if !directory.exists() {
-            debug!("Failed to find {:?}; creating it", directory);
-            std::fs::create_dir_all(&directory)?;
-        } else if !directory.is_dir() {
-            debug!("Linked directory {:?} is a file", directory);
-            return Err(KvError::Parse(
-                format!("{:?} is not a directory", directory).into(),
-            ));
-        }
-
-        let dir = std::fs::read_dir(&directory)?;
-        let mut redo_log_path = None;
-        for entry in dir {
-            let entry = entry?;
-            if let Some(s) = entry.path().extension() {
-                if s == "redo" {
-                    trace!("Found redo log: {:?}", entry.path());
-                    // TODO: If we find multiple redo logs on startup, we should
-                    // just compress them right now. At least we should include
-                    // an option for the user to submit.
-                    redo_log_path = Some(entry.path());
-                    break;
-                }
-            }
-        }
-
-        let levels = Levels::new(directory.as_path())?;
-        let sstable = match redo_log_path {
-            Some(file) => SSTable::from_write_ahead_log(file),
-            None => SSTable::new(&directory),
-        }?;
-
-        info!("State read, application ready for requests");
-        Ok(Self {
-            directory: Arc::new(directory),
-            sstable: Arc::new(RwLock::new(sstable)),
-            levels,
-        })
+        Self::new(folder)
     }
 
     fn set(&self, key: Vec<u8>, value: Vec<u8>) -> crate::Result<()> {

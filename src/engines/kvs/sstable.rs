@@ -189,6 +189,7 @@ impl std::fmt::Display for MemoryTable {
 pub struct SSTable {
     inner: MemoryTable,
     write_ahead_log: Arc<Mutex<BufWriter<File>>>,
+    write_ahead_log_path: PathBuf,
 }
 
 impl SSTable {
@@ -201,6 +202,7 @@ impl SSTable {
         Ok(Self {
             inner: MemoryTable::new(),
             write_ahead_log: Arc::new(Mutex::new(writer)),
+            write_ahead_log_path: directory.as_ref().to_path_buf(),
         })
     }
 
@@ -213,15 +215,17 @@ impl SSTable {
         Ok(Self {
             inner,
             write_ahead_log: Arc::new(Mutex::new(writer)),
+            write_ahead_log_path: path.as_ref().to_path_buf(),
         })
     }
 
-    /// Append a key value to the SSTable and write it to our log
+    /// Append a key value to memory inside of SSTable and then write it to our log
     pub fn append(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> crate::Result<usize> {
         let record = Record::new(key, value);
         let bytes = bincode::serialize(&record)?;
         let mut lock = self.write_ahead_log.lock().unwrap();
         lock.write_all(&bytes)?;
+        lock.flush()?;
         drop(lock);
         Ok(self.inner.append(record))
     }
@@ -250,12 +254,12 @@ impl std::fmt::Display for SSTable {
 
 impl Drop for SSTable {
     fn drop(&mut self) {
-        // let path = self.write_ahead_log_path.as_path();
-        // trace!("Attempting to remove redo log {:?}", &path);
-        // match std::fs::remove_file(path) {
-        //     Ok(_) => info!("Successfully removed redo log {:?}", &path),
-        //     Err(e) => error!("Failed to remove redo log {:?} with error {:?}", &path, e),
-        // };
+        let path = self.write_ahead_log_path.as_path();
+        trace!("Attempting to remove redo log {:?}", &path);
+        match std::fs::remove_file(path) {
+            Ok(_) => info!("Successfully removed redo log {:?}", &path),
+            Err(e) => error!("Failed to remove redo log {:?} with error {:?}", &path, e),
+        };
     }
 }
 
