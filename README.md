@@ -59,6 +59,22 @@ Examples of possible match patterns are the following:
 
 You "restore" a database.
 
+## Flexibility
+
+Part of the feature set I want from this key value store is the ability to create
+a tree of user data. It would still act as a key value store but data can be
+kept as a tree and retried as such.
+
+To accomplish this, I propose that we accept input as an _slice of strings_
+
+eg.
+
+```rust
+KvsStore::get(&["top", "middle", "lower", "key"], "value")
+```
+
+Each level is a **family**, similar to _Column Families_ in [RocksDB](.notes/chapter-2/resources/rocksdb.md).
+
 ## TODO
 
 | Done  | Description                                                                                                                                          |
