@@ -135,7 +135,7 @@ impl Level {
         trace!(
             "Adding {} to {:?}",
             storage,
-            self.inner.read().unwrap().segments.len()
+            self.inner.read().unwrap().segments
         );
         self.inner.write().unwrap().segments.push(storage);
         Ok(())

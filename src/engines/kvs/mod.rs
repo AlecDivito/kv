@@ -37,6 +37,7 @@ impl KvStore {
     }
 
     fn write(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> crate::Result<()> {
+        // write a new value to the sstable
         let new_size = self.sstable.read().unwrap().append(key, value)?;
 
         if self.config.should_rotate_wal(new_size) {

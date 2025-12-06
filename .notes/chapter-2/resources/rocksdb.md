@@ -88,6 +88,11 @@ is created. Track the closing events by:
 
 When a MemTable is flushed, sync Manifest file
 
+A WAL is logically obsolete once all of the column families data in the WAL have
+been flushed to disk. RocksDB would rather track the event of a WAL becoming
+obsolete, then deleting the WAL once it is obsolete. Then in a background thread
+the WAL will be deleted.
+
 ### Manifest
 
 Journal the in-memory state **updates**. Keep track of RocksDB state changes in
@@ -135,3 +140,13 @@ reference the ColumnFamily you are writing to as a number.
 The main idea is that these families **share the WAL, but not the Memtable**. We
 can only delete the WAL, once all Column Families have been flushed and all data
 contained in the WAL is saved into table files.
+
+## Caching
+
+Two types of caches exist inside RocksDB.
+
+1. LRUCache (Least recently used cache)
+2. ClockCache
+
+Overall, 32MB capacity is set for a cache. Each shard maintians it's own LRU list
+and a hash map for lookups.
